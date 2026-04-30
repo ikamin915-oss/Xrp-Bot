@@ -39,7 +39,7 @@ from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
 
-FUTURES_LIVE_URL = "https://fapi.binance.com"
+FUTURES_LIVE_URL = "https://fapi.binance.me"
 FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
@@ -358,8 +358,7 @@ class BinanceFuturesBot:
             "secret": config.api_secret,
             "timeout": config.request_timeout,
         }
-        if config.use_testnet:
-            client_kwargs["base_url"] = FUTURES_TESTNET_URL
+        client_kwargs["base_url"] = self.futures_base_url
         self.client = UMFutures(**client_kwargs)
         self.symbol_rules: Optional[SymbolRules] = None
         self.current_day: date = utc_today()
