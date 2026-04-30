@@ -30,6 +30,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import pandas as pd
@@ -37,6 +38,11 @@ import requests
 from binance.error import ClientError, ServerError
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - requirements.txt includes certifi.
+    certifi = None
 
 
 FUTURES_LIVE_URL = "https://fapi.binance.me"
@@ -420,7 +426,18 @@ class BinanceFuturesBot:
         if self.config.can_place_real_orders:
             self.configure_leverage()
 
+        self.log_startup_url(
+            "startup mark_price",
+            "GET",
+            self.futures_api_url("/fapi/v1/premiumIndex", {"symbol": self.config.symbol}),
+        )
         startup_price = self.get_mark_price()
+        if self.config.has_credentials:
+            self.log_startup_url(
+                "startup position_risk",
+                "GET",
+                self.futures_api_url("/fapi/v2/positionRisk", {"symbol": self.config.symbol}),
+            )
         startup_position = self.get_position_snapshot()
         send_discord_message(
             self.build_status_message(
@@ -488,18 +505,60 @@ class BinanceFuturesBot:
         self.logger.warning(warning)
         print(warning, file=sys.stderr)
 
+    def futures_api_url(
+        self,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> str:
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = f"{self.futures_base_url.rstrip('/')}{normalized_path}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        self.validate_futures_url(url)
+        return url
+
+    def validate_futures_url(self, url: str) -> None:
+        allowed_bases = (FUTURES_LIVE_URL, FUTURES_TESTNET_URL)
+        if not url.startswith(allowed_bases):
+            raise ConfigError(f"Blocked non-futures Binance URL: {url}")
+
+        lowered = url.lower()
+        live_domain = FUTURES_LIVE_URL.removeprefix("https://fapi.")
+        website_host = f"www.{live_domain}"
+        website_path = f"{live_domain}/" + "en"
+        if website_host in lowered or website_path in lowered:
+            raise ConfigError(f"Blocked Binance website URL: {url}")
+
+    def log_startup_url(self, label: str, method: str, url: str) -> None:
+        self.validate_futures_url(url)
+        self.logger.info("Startup URL [%s]: %s %s", label, method.upper(), url)
+
     def verify_connectivity(self) -> None:
-        base_url = FUTURES_TESTNET_URL if self.config.use_testnet else FUTURES_LIVE_URL
+        url = self.futures_api_url("/fapi/v1/time")
+        self.log_startup_url("connectivity time", "GET", url)
         response = requests.get(
-            f"{base_url}/fapi/v1/time",
+            url,
             timeout=self.config.request_timeout,
+            allow_redirects=False,
+            verify=certifi.where() if certifi else True,
         )
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("Location", "")
+            raise ConfigError(
+                "Binance Futures connectivity check attempted to redirect. "
+                f"Only Futures API URLs are allowed. url={url} location={location}"
+            )
         response.raise_for_status()
         server_time = response.json().get("serverTime")
         self.logger.info("Binance Futures API reachable. serverTime=%s", server_time)
 
     def validate_futures_public_endpoints(self) -> None:
         try:
+            self.log_startup_url(
+                "public exchange_info validation",
+                "GET",
+                self.futures_api_url("/fapi/v1/exchangeInfo"),
+            )
             self.client.exchange_info()
             self.logger.info("Startup validation passed: client.exchange_info()")
         except ClientError as exc:
@@ -511,6 +570,11 @@ class BinanceFuturesBot:
             return
 
         try:
+            self.log_startup_url(
+                "public mark_price validation",
+                "GET",
+                self.futures_api_url("/fapi/v1/premiumIndex", {"symbol": self.config.symbol}),
+            )
             self.client.mark_price(symbol=self.config.symbol)
             self.logger.info("Startup validation passed: client.mark_price(symbol=%s)", self.config.symbol)
         except ClientError as exc:
@@ -519,6 +583,11 @@ class BinanceFuturesBot:
             self.logger.warning("Optional startup mark_price request failed: %s", exc)
 
     def fetch_symbol_rules(self) -> SymbolRules:
+        self.log_startup_url(
+            "symbol rules exchange_info",
+            "GET",
+            self.futures_api_url("/fapi/v1/exchangeInfo"),
+        )
         exchange_info = self.client.exchange_info()
         symbol_info = next(
             (item for item in exchange_info["symbols"] if item["symbol"] == self.config.symbol),
@@ -551,6 +620,11 @@ class BinanceFuturesBot:
             "Setting leverage for %s to %sx.",
             self.config.symbol,
             self.config.leverage,
+        )
+        self.log_startup_url(
+            "change leverage",
+            "POST",
+            self.futures_api_url("/fapi/v1/leverage", {"symbol": self.config.symbol}),
         )
         self.client.change_leverage(
             symbol=self.config.symbol,
