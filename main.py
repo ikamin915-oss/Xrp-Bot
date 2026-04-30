@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - requirements.txt includes certifi.
     certifi = None
 
 
-FUTURES_LIVE_URL = "https://fapi.binance.me"
+FUTURES_LIVE_URL = "https://fapi.binance.com"
 FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
