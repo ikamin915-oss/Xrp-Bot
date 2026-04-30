@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - requirements.txt includes certifi.
     certifi = None
 
 
-FUTURES_LIVE_URL = "https://fapi.binance.com"
+FUTURES_LIVE_URL = "https://fapi.binance.me"
 FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
@@ -116,6 +116,8 @@ DISCORD_TIMEOUT_SECONDS = 10
 DISCORD_MAX_FIELD_VALUE_LENGTH = 1024
 DISCORD_MAX_DESCRIPTION_LENGTH = 4096
 DISCORD_MAX_EMBED_FIELDS = 25
+CANDLE_FETCH_MAX_ATTEMPTS = 3
+CANDLE_FETCH_RETRY_SECONDS = 3
 DISCORD_EMBED_COLORS = {
     "success": 0x2ECC71,
     "info": 0x3498DB,
@@ -206,7 +208,7 @@ class BotConfig:
             api_secret=normalize_secret(os.getenv("BINANCE_API_SECRET")),
             symbol=symbol,
             interval=interval,
-            candle_limit=get_int_env("CANDLE_LIMIT", 150),
+            candle_limit=get_int_env("CANDLE_LIMIT", 250),
             ema_fast=get_int_env("EMA_FAST", 7),
             ema_slow=get_int_env("EMA_SLOW", 25),
             ema_trend=get_int_env("EMA_TREND", 99),
@@ -381,6 +383,7 @@ class BinanceFuturesBot:
         self.exit_state: Optional[PositionExitState] = None
         self.current_trade_context: Optional[TradeContext] = None
         self.learning_analysis_triggers_run: set[str] = set()
+        self.last_candle_fetch_warning = "Not enough candles returned; skipping cycle."
 
     def run(self) -> None:
         self.logger.info("Loaded environment file: %s", ENV_PATH)
@@ -635,14 +638,37 @@ class BinanceFuturesBot:
         assert self.symbol_rules is not None
 
         self.reset_daily_counters_if_needed()
-        candles = self.fetch_candles()
-        signal = self.generate_signal(candles)
         mark_price = self.get_mark_price()
         position = self.get_position() if self.config.has_credentials else Position(
             quantity=Decimal("0"),
             entry_price=Decimal("0"),
         )
         self.last_known_position = position
+        self.logger.info(
+            "Current position: side=%s quantity=%s entry=%s",
+            position.side,
+            format_decimal(abs(position.quantity)),
+            format_decimal(position.entry_price),
+        )
+
+        if self.config.can_place_real_orders:
+            if position.is_open:
+                self.ensure_software_monitoring_state(position)
+            else:
+                self.exit_state = None
+                self.cancel_all_reduce_only_orders()
+
+        if position.is_open:
+            if self.handle_exit_rules(position, mark_price):
+                self.logger.info("Exit action handled. Waiting for the next cycle.")
+                return
+
+        candles = self.fetch_candles()
+        if candles is None:
+            self.handle_candle_fetch_skip(mark_price, position)
+            return
+
+        signal = self.generate_signal(candles)
         self.last_signal = f"{signal.action} | {signal.reason}"
 
         self.logger.info(
@@ -658,28 +684,10 @@ class BinanceFuturesBot:
             signal.ema_trend,
             signal.reason,
         )
-        self.logger.info(
-            "Current position: side=%s quantity=%s entry=%s",
-            position.side,
-            format_decimal(abs(position.quantity)),
-            format_decimal(position.entry_price),
-        )
 
         if signal.action != "HOLD":
             self.maybe_send_signal_alert(signal, mark_price)
         self.maybe_send_heartbeat(mark_price, position)
-
-        if self.config.can_place_real_orders:
-            if position.is_open:
-                self.ensure_software_monitoring_state(position)
-            else:
-                self.exit_state = None
-                self.cancel_all_reduce_only_orders()
-
-        if position.is_open:
-            if self.handle_exit_rules(position, mark_price):
-                self.logger.info("Exit action handled. Waiting for the next cycle.")
-                return
 
         if signal.action == "HOLD":
             self.logger.info("No entry signal this cycle.")
@@ -722,15 +730,63 @@ class BinanceFuturesBot:
 
         self.open_position(signal, planned_quantity, mark_price)
 
-    def fetch_candles(self) -> pd.DataFrame:
-        raw_klines = self.client.klines(
-            symbol=self.config.symbol,
-            interval=self.config.interval,
-            limit=self.config.candle_limit,
-        )
-        if len(raw_klines) < self.config.ema_trend + 3:
-            raise RuntimeError("Not enough candles returned from Binance to build indicators.")
+    def fetch_candles(self) -> Optional[pd.DataFrame]:
+        min_required = self.config.ema_trend + 3
+        last_count = 0
+        last_error: Optional[Exception] = None
 
+        for attempt in range(1, CANDLE_FETCH_MAX_ATTEMPTS + 1):
+            try:
+                raw_klines = self.client.klines(
+                    symbol=self.config.symbol,
+                    interval=self.config.interval,
+                    limit=self.config.candle_limit,
+                )
+                last_error = None
+                last_count = len(raw_klines)
+                if last_count >= min_required:
+                    self.last_candle_fetch_warning = ""
+                    return self.build_candle_frame(raw_klines)
+
+                self.logger.warning(
+                    "Not enough candles returned from Binance. attempt=%s/%s received=%s required=%s limit=%s",
+                    attempt,
+                    CANDLE_FETCH_MAX_ATTEMPTS,
+                    last_count,
+                    min_required,
+                    self.config.candle_limit,
+                )
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    "Candle fetch attempt %s/%s failed: %s",
+                    attempt,
+                    CANDLE_FETCH_MAX_ATTEMPTS,
+                    format_exception_for_log(exc),
+                )
+
+            if attempt < CANDLE_FETCH_MAX_ATTEMPTS:
+                time.sleep(CANDLE_FETCH_RETRY_SECONDS)
+
+        if last_error is not None:
+            self.last_candle_fetch_warning = (
+                "Candle fetch failed after retries; skipping cycle. "
+                f"last_error={format_exception_for_log(last_error)}"
+            )
+            self.logger.warning(self.last_candle_fetch_warning)
+            return None
+
+        self.last_candle_fetch_warning = "Not enough candles returned; skipping cycle."
+        self.logger.warning(
+            "%s received=%s required=%s limit=%s",
+            self.last_candle_fetch_warning,
+            last_count,
+            min_required,
+            self.config.candle_limit,
+        )
+        return None
+
+    def build_candle_frame(self, raw_klines: list[list[Any]]) -> pd.DataFrame:
         frame = pd.DataFrame(raw_klines, columns=KLINE_COLUMNS)
         for column in ("open", "high", "low", "close", "volume"):
             frame[column] = frame[column].astype(float)
@@ -741,6 +797,21 @@ class BinanceFuturesBot:
         frame["ema_slow"] = frame["close"].ewm(span=self.config.ema_slow, adjust=False).mean()
         frame["ema_trend"] = frame["close"].ewm(span=self.config.ema_trend, adjust=False).mean()
         return frame
+
+    def handle_candle_fetch_skip(self, mark_price: Decimal, position: Position) -> None:
+        warning = self.last_candle_fetch_warning or "Not enough candles returned; skipping cycle."
+        message = (
+            f"{warning}\n"
+            f"symbol: {self.config.symbol}\n"
+            f"interval: {self.config.interval}\n"
+            f"mode: {self.config.mode_label}\n"
+            f"mark_price: {format_decimal(mark_price)}\n"
+            f"open_position_side: {position.side}\n"
+            f"action: new entries skipped; open-position SL/TP/BE monitoring already checked"
+        )
+        self.logger.warning(message.replace("\n", " | "))
+        send_discord_message(message)
+        self.maybe_send_heartbeat(mark_price, position)
 
     def generate_signal(self, candles: pd.DataFrame) -> TradingSignal:
         if len(candles) < 3:
@@ -1919,6 +1990,12 @@ def format_binance_api_error(exc: ClientError) -> str:
     if status_code is not None:
         return f"status_code={status_code} code={code} message={message}"
     return f"code={code} message={message}"
+
+
+def format_exception_for_log(exc: Exception) -> str:
+    if isinstance(exc, ClientError):
+        return format_binance_api_error(exc)
+    return str(exc)
 
 
 def calculate_unrealized_profit_pct(position: Position, mark_price: Decimal) -> Decimal:
