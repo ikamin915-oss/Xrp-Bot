@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-04-30T17:35:13.651263+00:00",
+  "suggested_only": true,
+  "auto_apply_learning_requested": false,
+  "auto_apply_learning_disabled_for_safety": true,
+  "minimum_trades_before_learning": 20,
+  "enough_trades_for_learning": false,
+  "metrics": {
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate_pct": 0,
+    "average_win": 0,
+    "average_loss": 0,
+    "gross_profit": 0,
+    "gross_loss": 0,
+    "profit_factor": 0,
+    "max_consecutive_losses": 0
+  },
+  "detected_losing_patterns": [],
+  "pattern_thresholds_used": {},
+  "recommended_parameter_changes": [],
+  "safety_constraints": [
+    "Do not auto-apply recommendations.",
+    "Do not increase leverage from learning.",
+    "Do not increase order size from learning.",
+    "Only stricter filters may be recommended."
+  ]
+}

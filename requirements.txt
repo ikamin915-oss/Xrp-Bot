@@ -1,0 +1,4 @@
+binance-futures-connector
+pandas
+python-dotenv
+requests
