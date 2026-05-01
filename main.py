@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - requirements.txt includes certifi.
     certifi = None
 
 
-FUTURES_LIVE_URL = "https://fapi.binance.com"
+FUTURES_LIVE_URL = "https://fapi.binance.me"
 FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
@@ -118,6 +118,8 @@ DISCORD_MAX_DESCRIPTION_LENGTH = 4096
 DISCORD_MAX_EMBED_FIELDS = 25
 CANDLE_FETCH_MAX_ATTEMPTS = 3
 CANDLE_FETCH_RETRY_SECONDS = 3
+MAX_ALLOWED_LEVERAGE = 3
+WALLET_BALANCE_ASSET = "USDC"
 DISCORD_EMBED_COLORS = {
     "success": 0x2ECC71,
     "info": 0x3498DB,
@@ -144,6 +146,12 @@ class BotConfig:
     ema_trend: int
     order_size_quote: Decimal
     leverage: int
+    use_wallet_percent_size: bool
+    wallet_margin_pct: Decimal
+    max_wallet_margin_pct: Decimal
+    min_order_size_quote: Decimal
+    max_order_size_quote: Decimal
+    allow_large_size: bool
     stop_loss_pct: Decimal
     tp1_profit_pct: Decimal
     tp2_profit_pct: Decimal
@@ -196,6 +204,14 @@ class BotConfig:
             return "API credentials are missing"
         return None
 
+    @property
+    def effective_wallet_margin_pct(self) -> Decimal:
+        return min(self.wallet_margin_pct, self.max_wallet_margin_pct)
+
+    @property
+    def wallet_margin_pct_is_capped(self) -> bool:
+        return self.wallet_margin_pct > self.max_wallet_margin_pct
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         load_dotenv(dotenv_path=ENV_PATH, override=True)
@@ -213,7 +229,13 @@ class BotConfig:
             ema_slow=get_int_env("EMA_SLOW", 25),
             ema_trend=get_int_env("EMA_TREND", 99),
             order_size_quote=get_order_size_quote_env("6"),
-            leverage=get_int_env("LEVERAGE", 5),
+            leverage=get_int_env("LEVERAGE", 3),
+            use_wallet_percent_size=get_bool_env("USE_WALLET_PERCENT_SIZE", False),
+            wallet_margin_pct=get_decimal_env("WALLET_MARGIN_PCT", "20"),
+            max_wallet_margin_pct=get_decimal_env("MAX_WALLET_MARGIN_PCT", "30"),
+            min_order_size_quote=get_decimal_env("MIN_ORDER_SIZE_USDT", "6"),
+            max_order_size_quote=get_decimal_env("MAX_ORDER_SIZE_USDT", "25"),
+            allow_large_size=get_bool_env("ALLOW_LARGE_SIZE", False),
             stop_loss_pct=get_decimal_env("STOP_LOSS_PCT", "0.35"),
             tp1_profit_pct=get_decimal_env("TP1_PROFIT_PCT", "0.5"),
             tp2_profit_pct=get_decimal_env("TP2_PROFIT_PCT", "0.9"),
@@ -256,6 +278,18 @@ class BotConfig:
             raise ConfigError("ORDER_SIZE_USDC/ORDER_SIZE_USDT must be greater than 0.")
         if self.leverage <= 0:
             raise ConfigError("LEVERAGE must be greater than 0.")
+        if self.leverage > MAX_ALLOWED_LEVERAGE:
+            raise ConfigError(f"LEVERAGE cannot exceed {MAX_ALLOWED_LEVERAGE}.")
+        if not Decimal("0") < self.wallet_margin_pct <= Decimal("100"):
+            raise ConfigError("WALLET_MARGIN_PCT must be between 0 and 100.")
+        if not Decimal("0") < self.max_wallet_margin_pct <= Decimal("100"):
+            raise ConfigError("MAX_WALLET_MARGIN_PCT must be between 0 and 100.")
+        if self.min_order_size_quote <= 0:
+            raise ConfigError("MIN_ORDER_SIZE_USDT must be greater than 0.")
+        if self.max_order_size_quote <= 0:
+            raise ConfigError("MAX_ORDER_SIZE_USDT must be greater than 0.")
+        if self.max_order_size_quote < self.min_order_size_quote:
+            raise ConfigError("MAX_ORDER_SIZE_USDT must be greater than or equal to MIN_ORDER_SIZE_USDT.")
         if not Decimal("0") < self.stop_loss_pct < Decimal("100"):
             raise ConfigError("STOP_LOSS_PCT must be between 0 and 100.")
         if not Decimal("0") < self.tp1_profit_pct < self.tp2_profit_pct < Decimal("100"):
@@ -356,6 +390,21 @@ class TradeContext:
     tp1_hit_before_exit: bool = False
 
 
+@dataclass(frozen=True)
+class SizingPlan:
+    source: str
+    notional: Decimal
+    leverage: int
+    min_notional: Decimal
+    max_notional: Decimal
+    allow_large_size: bool
+    capped_to_max: bool = False
+    wallet_asset: Optional[str] = None
+    wallet_balance: Optional[Decimal] = None
+    margin_pct_used: Optional[Decimal] = None
+    margin_amount: Optional[Decimal] = None
+
+
 class BinanceFuturesBot:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
@@ -395,9 +444,17 @@ class BinanceFuturesBot:
             self.config.mode_label,
         )
         self.logger.info(
-            "Risk settings: LEVERAGE=%sx requested_order_size=%s",
+            "Risk settings: LEVERAGE=%sx requested_order_size=%s sizing_mode=%s "
+            "wallet_margin_pct=%s effective_wallet_margin_pct=%s min_order_size=%s "
+            "max_order_size=%s allow_large_size=%s",
             self.config.leverage,
             format_decimal(self.config.order_size_quote),
+            "wallet_percent" if self.config.use_wallet_percent_size else "fixed",
+            format_decimal(self.config.wallet_margin_pct),
+            format_decimal(self.config.effective_wallet_margin_pct),
+            format_decimal(self.config.min_order_size_quote),
+            format_decimal(self.config.max_order_size_quote),
+            self.config.allow_large_size,
         )
         self.logger.info(
             "Learning settings: ANALYZE_ON_START=%s AUTO_APPLY_LEARNING=%s MIN_TRADES_BEFORE_LEARNING=%s",
@@ -416,6 +473,7 @@ class BinanceFuturesBot:
         self.logger.info("symbol=%s", self.config.symbol)
         self.logger.info("API key exists=%s", bool(self.config.api_key))
         self.warn_live_mode_if_needed()
+        self.warn_wallet_margin_cap_if_needed()
         self.verify_connectivity()
         self.validate_futures_public_endpoints()
         self.symbol_rules = self.fetch_symbol_rules()
@@ -507,6 +565,23 @@ class BinanceFuturesBot:
         warning = "Auto-apply learning is disabled for safety."
         self.logger.warning(warning)
         print(warning, file=sys.stderr)
+
+    def warn_wallet_margin_cap_if_needed(self) -> None:
+        if not self.config.wallet_margin_pct_is_capped:
+            return
+
+        action = "using capped wallet margin percent for position sizing"
+        if not self.config.use_wallet_percent_size:
+            action = "wallet sizing is disabled; capped value will be used if wallet sizing is enabled"
+        warning = (
+            "Wallet margin percent capped\n"
+            f"configured_wallet_margin_pct: {format_decimal(self.config.wallet_margin_pct)}\n"
+            f"max_wallet_margin_pct: {format_decimal(self.config.max_wallet_margin_pct)}\n"
+            f"effective_wallet_margin_pct: {format_decimal(self.config.effective_wallet_margin_pct)}\n"
+            f"action: {action}"
+        )
+        self.logger.warning(warning.replace("\n", " | "))
+        send_discord_message(warning)
 
     def futures_api_url(
         self,
@@ -718,17 +793,24 @@ class BinanceFuturesBot:
             self.handle_trade_block(trade_block_reason, signal.action, mark_price, position)
             return
 
-        planned_quantity = self.calculate_order_quantity(mark_price)
+        try:
+            planned_quantity, sizing_plan = self.calculate_order_quantity(mark_price)
+        except ConfigError as exc:
+            self.handle_sizing_skip(signal.action, mark_price, str(exc))
+            return
+
+        self.log_sizing_plan(sizing_plan)
+        self.send_sizing_alert(signal.action, planned_quantity, mark_price, sizing_plan)
 
         if self.config.dry_run:
-            self.log_dry_run_entry_plan(signal.action, planned_quantity, mark_price)
+            self.log_dry_run_entry_plan(signal.action, planned_quantity, mark_price, sizing_plan)
             return
         if not self.config.can_place_real_orders:
             self.log_order_block(f"opening {signal.action} position")
-            self.log_dry_run_entry_plan(signal.action, planned_quantity, mark_price)
+            self.log_dry_run_entry_plan(signal.action, planned_quantity, mark_price, sizing_plan)
             return
 
-        self.open_position(signal, planned_quantity, mark_price)
+        self.open_position(signal, planned_quantity, mark_price, sizing_plan)
 
     def fetch_candles(self) -> Optional[pd.DataFrame]:
         min_required = self.config.ema_trend + 3
@@ -1257,11 +1339,11 @@ class BinanceFuturesBot:
         self.close_position(position, mark_price, reason)
         return True
 
-    def calculate_order_quantity(self, mark_price: Decimal) -> Decimal:
+    def calculate_order_quantity(self, mark_price: Decimal) -> tuple[Decimal, SizingPlan]:
         assert self.symbol_rules is not None
 
-        order_notional = self.calculate_order_notional_quote()
-        raw_quantity = order_notional / mark_price
+        sizing_plan = self.calculate_order_sizing_quote()
+        raw_quantity = sizing_plan.notional / mark_price
         quantity = round_to_step(raw_quantity, self.symbol_rules.qty_step)
 
         if quantity < self.symbol_rules.min_qty:
@@ -1279,32 +1361,166 @@ class BinanceFuturesBot:
                 f"Order notional {format_decimal(quantity * mark_price)} is below Binance minimum "
                 f"{format_decimal(self.symbol_rules.min_notional)}."
             )
-        return quantity
+        return quantity, sizing_plan
 
-    def calculate_order_notional_quote(self) -> Decimal:
-        requested_notional = self.config.order_size_quote
+    def calculate_order_sizing_quote(self) -> SizingPlan:
+        if self.config.use_wallet_percent_size:
+            return self.calculate_wallet_percent_sizing_quote()
 
-        if not self.config.can_place_real_orders:
-            self.logger.info(
-                "Using fixed ORDER_SIZE from env=%s because live wallet sizing is not active.",
-                format_decimal(requested_notional),
-            )
-            return requested_notional
-
-        self.logger.info(
-            "Position sizing: using requested ORDER_SIZE from env=%s for %s with leverage=%sx.",
-            format_decimal(requested_notional),
-            self.config.symbol,
-            self.config.leverage,
+        notional, capped_to_max = self.apply_order_notional_limits(
+            self.config.order_size_quote,
+            source="fixed ORDER_SIZE_USDC/ORDER_SIZE_USDT",
         )
-        return requested_notional
+        return SizingPlan(
+            source="fixed",
+            notional=notional,
+            leverage=self.config.leverage,
+            min_notional=self.config.min_order_size_quote,
+            max_notional=self.config.max_order_size_quote,
+            allow_large_size=self.config.allow_large_size,
+            capped_to_max=capped_to_max,
+        )
 
-    def log_dry_run_entry_plan(self, action: str, quantity: Decimal, mark_price: Decimal) -> None:
+    def calculate_wallet_percent_sizing_quote(self) -> SizingPlan:
+        if not self.config.has_credentials:
+            raise ConfigError("USE_WALLET_PERCENT_SIZE=true requires Binance API credentials to fetch wallet balance.")
+
+        wallet_balance = self.get_futures_wallet_balance(WALLET_BALANCE_ASSET)
+        margin_pct = self.config.effective_wallet_margin_pct
+        margin_amount = wallet_balance * margin_pct / Decimal("100")
+        requested_notional = margin_amount * Decimal(self.config.leverage)
+        notional, capped_to_max = self.apply_order_notional_limits(
+            requested_notional,
+            source="wallet percent sizing",
+        )
+        return SizingPlan(
+            source="wallet_percent",
+            notional=notional,
+            leverage=self.config.leverage,
+            min_notional=self.config.min_order_size_quote,
+            max_notional=self.config.max_order_size_quote,
+            allow_large_size=self.config.allow_large_size,
+            capped_to_max=capped_to_max,
+            wallet_asset=WALLET_BALANCE_ASSET,
+            wallet_balance=wallet_balance,
+            margin_pct_used=margin_pct,
+            margin_amount=margin_amount,
+        )
+
+    def apply_order_notional_limits(self, requested_notional: Decimal, source: str) -> tuple[Decimal, bool]:
+        if requested_notional < self.config.min_order_size_quote:
+            raise ConfigError(
+                f"Calculated order notional {format_decimal(requested_notional)} from {source} is below "
+                f"MIN_ORDER_SIZE_USDT={format_decimal(self.config.min_order_size_quote)}."
+            )
+
+        if self.config.allow_large_size or requested_notional <= self.config.max_order_size_quote:
+            return requested_notional, False
+
+        self.logger.warning(
+            "Order notional capped from %s to MAX_ORDER_SIZE_USDT=%s because ALLOW_LARGE_SIZE=false.",
+            format_decimal(requested_notional),
+            format_decimal(self.config.max_order_size_quote),
+        )
+        return self.config.max_order_size_quote, True
+
+    def get_futures_wallet_balance(self, asset: str) -> Decimal:
+        try:
+            balances = self.client.balance()
+        except (ClientError, ServerError, requests.RequestException) as exc:
+            raise ConfigError(
+                f"Could not fetch futures {asset.upper()} wallet balance: {format_exception_for_log(exc)}"
+            ) from exc
+
+        target_asset = asset.upper()
+        for item in balances:
+            if str(item.get("asset", "")).upper() != target_asset:
+                continue
+            raw_balance = (
+                item.get("balance")
+                or item.get("walletBalance")
+                or item.get("crossWalletBalance")
+                or item.get("availableBalance")
+            )
+            if raw_balance is None:
+                raise ConfigError(f"Could not find a wallet balance value for futures asset {target_asset}.")
+            try:
+                balance = Decimal(str(raw_balance))
+            except InvalidOperation as exc:
+                raise ConfigError(f"Futures {target_asset} wallet balance is not a valid decimal.") from exc
+            if balance <= 0:
+                raise ConfigError(f"Futures {target_asset} wallet balance must be greater than 0.")
+            return balance
+        raise ConfigError(f"Could not find futures wallet balance for asset {target_asset}.")
+
+    def handle_sizing_skip(self, action: str, mark_price: Decimal, reason: str) -> None:
+        message = (
+            "Entry skipped because sizing failed\n"
+            f"symbol: {self.config.symbol}\n"
+            f"action: {action}\n"
+            f"mark_price: {format_decimal(mark_price)}\n"
+            f"reason: {reason}\n"
+            f"mode: {self.config.mode_label}"
+        )
+        self.logger.warning(message.replace("\n", " | "))
+        send_discord_message(message)
+
+    def log_sizing_plan(self, sizing_plan: SizingPlan) -> None:
+        self.logger.info(
+            "Position sizing: source=%s wallet_balance=%s margin_pct_used=%s margin_amount=%s "
+            "notional_size=%s min_order_size=%s max_order_size=%s leverage=%sx "
+            "capped_to_max=%s allow_large_size=%s",
+            sizing_plan.source,
+            format_optional_decimal(sizing_plan.wallet_balance),
+            format_optional_decimal(sizing_plan.margin_pct_used),
+            format_optional_decimal(sizing_plan.margin_amount),
+            format_decimal(sizing_plan.notional),
+            format_decimal(sizing_plan.min_notional),
+            format_decimal(sizing_plan.max_notional),
+            sizing_plan.leverage,
+            sizing_plan.capped_to_max,
+            sizing_plan.allow_large_size,
+        )
+
+    def send_sizing_alert(
+        self,
+        action: str,
+        quantity: Decimal,
+        mark_price: Decimal,
+        sizing_plan: SizingPlan,
+    ) -> None:
+        message = (
+            "Entry sizing prepared\n"
+            f"symbol: {self.config.symbol}\n"
+            f"action: {action}\n"
+            f"mode: {self.config.mode_label}\n"
+            f"sizing_source: {sizing_plan.source}\n"
+            f"wallet_asset: {sizing_plan.wallet_asset or 'n/a'}\n"
+            f"wallet_balance: {format_optional_decimal(sizing_plan.wallet_balance)}\n"
+            f"margin_percent_used: {format_optional_decimal(sizing_plan.margin_pct_used)}\n"
+            f"margin_amount: {format_optional_decimal(sizing_plan.margin_amount)}\n"
+            f"notional_size: {format_decimal(sizing_plan.notional)}\n"
+            f"min_order_size: {format_decimal(sizing_plan.min_notional)}\n"
+            f"max_order_size: {format_decimal(sizing_plan.max_notional)}\n"
+            f"leverage: {sizing_plan.leverage}x\n"
+            f"position_size: {format_decimal(quantity)}\n"
+            f"estimated_entry: {format_decimal(mark_price)}\n"
+            f"capped_to_max: {sizing_plan.capped_to_max}"
+        )
+        send_discord_message(message)
+
+    def log_dry_run_entry_plan(
+        self,
+        action: str,
+        quantity: Decimal,
+        mark_price: Decimal,
+        sizing_plan: SizingPlan,
+    ) -> None:
         signed_quantity = quantity if action == "LONG" else -quantity
         planned_position = Position(quantity=signed_quantity, entry_price=mark_price)
         tp1_quantity = self.calculate_tp1_quantity_from_original(quantity)
         tp2_quantity = round_to_step(quantity - tp1_quantity, self.symbol_rules.qty_step)
-        self.log_entry_risk_before_order(action, quantity, mark_price)
+        self.log_entry_risk_before_order(action, quantity, mark_price, sizing_plan)
         self.logger.info(
             "Dry-run enabled. Planned entry=%s quantity=%s %s",
             action,
@@ -1328,6 +1544,7 @@ class BinanceFuturesBot:
         action: str,
         quantity: Decimal,
         estimated_entry_price: Decimal,
+        sizing_plan: SizingPlan,
     ) -> None:
         signed_quantity = quantity if action == "LONG" else -quantity
         planned_position = Position(quantity=signed_quantity, entry_price=estimated_entry_price)
@@ -1338,7 +1555,7 @@ class BinanceFuturesBot:
 
         self.logger.info(
             "Entry plan before placing order: side=%s estimated_entry=%s stop_loss=%s "
-            "tp1=%s tp2=%s position_size=%s %s notional_usdt=%s",
+            "tp1=%s tp2=%s position_size=%s %s notional_usdt=%s sizing_source=%s leverage=%sx",
             action,
             format_decimal(estimated_entry_price),
             format_decimal(stop_loss),
@@ -1347,6 +1564,8 @@ class BinanceFuturesBot:
             format_decimal(quantity),
             self.config.symbol,
             format_decimal(notional),
+            sizing_plan.source,
+            sizing_plan.leverage,
         )
 
     def build_trade_context_from_signal(self, signal: TradingSignal, position: Position) -> TradeContext:
@@ -1607,6 +1826,7 @@ class BinanceFuturesBot:
         signal: TradingSignal,
         quantity: Decimal,
         mark_price: Decimal,
+        sizing_plan: SizingPlan,
     ) -> None:
         action = signal.action
         side = "BUY" if action == "LONG" else "SELL"
@@ -1616,7 +1836,7 @@ class BinanceFuturesBot:
             format_decimal(quantity),
             self.config.symbol,
         )
-        self.log_entry_risk_before_order(action, quantity, mark_price)
+        self.log_entry_risk_before_order(action, quantity, mark_price, sizing_plan)
         self.submit_market_order(side=side, quantity=quantity, reduce_only=False)
 
         try:
@@ -1648,6 +1868,9 @@ class BinanceFuturesBot:
             f"side: {action}\n"
             f"price: {format_decimal(live_position.entry_price or mark_price)}\n"
             f"quantity: {format_decimal(abs(live_position.quantity))}\n"
+            f"sizing_source: {sizing_plan.source}\n"
+            f"notional_size: {format_decimal(sizing_plan.notional)}\n"
+            f"leverage: {sizing_plan.leverage}x\n"
             f"reason: {signal.reason}\n"
             f"protection: software-managed SL/TP active\n"
             f"trades_today: {self.trades_today}\n"
@@ -2193,6 +2416,10 @@ def candle_direction(candle: pd.Series) -> str:
 def format_decimal(value: Decimal) -> str:
     normalized = format(value.normalize(), "f")
     return normalized.rstrip("0").rstrip(".") or "0"
+
+
+def format_optional_decimal(value: Optional[Decimal]) -> str:
+    return "n/a" if value is None else format_decimal(value)
 
 
 def normalize_secret(value: Optional[str]) -> Optional[str]:
