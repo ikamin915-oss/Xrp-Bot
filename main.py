@@ -153,6 +153,16 @@ class BotConfig:
     min_order_size_quote: Decimal
     max_order_size_quote: Decimal
     allow_large_size: bool
+    min_ema_spread_pct: Decimal
+    ema_slope_lookback: int
+    min_ema_fast_slope_pct: Decimal
+    min_ema_slow_slope_pct: Decimal
+    ema99_slope_lookback: int
+    min_ema99_slope_pct: Decimal
+    max_distance_from_ema7_pct: Decimal
+    min_candle_body_ratio: Decimal
+    trend_momentum_lookback: int
+    min_trend_momentum_pct: Decimal
     stop_loss_pct: Decimal
     tp1_profit_pct: Decimal
     tp2_profit_pct: Decimal
@@ -237,6 +247,16 @@ class BotConfig:
             min_order_size_quote=get_decimal_env("MIN_ORDER_SIZE_USDT", "6"),
             max_order_size_quote=get_decimal_env("MAX_ORDER_SIZE_USDT", "25"),
             allow_large_size=get_bool_env("ALLOW_LARGE_SIZE", False),
+            min_ema_spread_pct=get_decimal_env("MIN_EMA_SPREAD_PCT", "0.03"),
+            ema_slope_lookback=get_int_env("EMA_SLOPE_LOOKBACK", 3),
+            min_ema_fast_slope_pct=get_decimal_env("MIN_EMA_FAST_SLOPE_PCT", "0.01"),
+            min_ema_slow_slope_pct=get_decimal_env("MIN_EMA_SLOW_SLOPE_PCT", "0.005"),
+            ema99_slope_lookback=get_int_env("EMA99_SLOPE_LOOKBACK", 12),
+            min_ema99_slope_pct=get_decimal_env("MIN_EMA99_SLOPE_PCT", "0.015"),
+            max_distance_from_ema7_pct=get_decimal_env("MAX_DISTANCE_FROM_EMA7_PCT", "0.18"),
+            min_candle_body_ratio=get_decimal_env("MIN_CANDLE_BODY_RATIO", "0.45"),
+            trend_momentum_lookback=get_int_env("TREND_MOMENTUM_LOOKBACK", 5),
+            min_trend_momentum_pct=get_decimal_env("MIN_TREND_MOMENTUM_PCT", "0.05"),
             stop_loss_pct=get_decimal_env("STOP_LOSS_PCT", "0.35"),
             tp1_profit_pct=get_decimal_env("TP1_PROFIT_PCT", "0.5"),
             tp2_profit_pct=get_decimal_env("TP2_PROFIT_PCT", "0.9"),
@@ -291,6 +311,24 @@ class BotConfig:
             raise ConfigError("MAX_ORDER_SIZE_USDT must be greater than 0.")
         if self.max_order_size_quote < self.min_order_size_quote:
             raise ConfigError("MAX_ORDER_SIZE_USDT must be greater than or equal to MIN_ORDER_SIZE_USDT.")
+        if self.min_ema_spread_pct < 0:
+            raise ConfigError("MIN_EMA_SPREAD_PCT must be 0 or greater.")
+        if self.ema_slope_lookback <= 0:
+            raise ConfigError("EMA_SLOPE_LOOKBACK must be greater than 0.")
+        if self.min_ema_fast_slope_pct < 0 or self.min_ema_slow_slope_pct < 0:
+            raise ConfigError("MIN_EMA_FAST_SLOPE_PCT and MIN_EMA_SLOW_SLOPE_PCT must be 0 or greater.")
+        if self.ema99_slope_lookback <= 0:
+            raise ConfigError("EMA99_SLOPE_LOOKBACK must be greater than 0.")
+        if self.min_ema99_slope_pct < 0:
+            raise ConfigError("MIN_EMA99_SLOPE_PCT must be 0 or greater.")
+        if self.max_distance_from_ema7_pct <= 0:
+            raise ConfigError("MAX_DISTANCE_FROM_EMA7_PCT must be greater than 0.")
+        if not Decimal("0") <= self.min_candle_body_ratio <= Decimal("1"):
+            raise ConfigError("MIN_CANDLE_BODY_RATIO must be between 0 and 1.")
+        if self.trend_momentum_lookback <= 0:
+            raise ConfigError("TREND_MOMENTUM_LOOKBACK must be greater than 0.")
+        if self.min_trend_momentum_pct < 0:
+            raise ConfigError("MIN_TREND_MOMENTUM_PCT must be 0 or greater.")
         if not Decimal("0") < self.stop_loss_pct < Decimal("100"):
             raise ConfigError("STOP_LOSS_PCT must be between 0 and 100.")
         if not Decimal("0") < self.tp1_profit_pct < self.tp2_profit_pct < Decimal("100"):
@@ -355,8 +393,12 @@ class TradingSignal:
     ema_slow: Decimal
     ema_trend: Decimal
     ema_spread_pct: Decimal
+    ema_fast_slope_pct: Decimal
+    ema_slow_slope_pct: Decimal
+    ema_trend_slope_pct: Decimal
     candle_body_ratio: Decimal
     distance_from_ema7_pct: Decimal
+    trend_momentum_pct: Decimal
     volume: Decimal
     previous_candle_direction: str
     candle_close_time: pd.Timestamp
@@ -462,6 +504,22 @@ class BinanceFuturesBot:
             self.config.analyze_on_start,
             self.config.auto_apply_learning,
             self.config.min_trades_before_learning,
+        )
+        self.logger.info(
+            "Entry quality filters: min_ema_spread_pct=%s ema_slope_lookback=%s "
+            "min_ema_fast_slope_pct=%s min_ema_slow_slope_pct=%s ema99_slope_lookback=%s "
+            "min_ema99_slope_pct=%s max_distance_from_ema7_pct=%s min_candle_body_ratio=%s "
+            "trend_momentum_lookback=%s min_trend_momentum_pct=%s",
+            format_decimal(self.config.min_ema_spread_pct),
+            self.config.ema_slope_lookback,
+            format_decimal(self.config.min_ema_fast_slope_pct),
+            format_decimal(self.config.min_ema_slow_slope_pct),
+            self.config.ema99_slope_lookback,
+            format_decimal(self.config.min_ema99_slope_pct),
+            format_decimal(self.config.max_distance_from_ema7_pct),
+            format_decimal(self.config.min_candle_body_ratio),
+            self.config.trend_momentum_lookback,
+            format_decimal(self.config.min_trend_momentum_pct),
         )
         self.warn_learning_auto_apply_if_needed()
         if self.config.analyze_on_start:
@@ -748,7 +806,9 @@ class BinanceFuturesBot:
         self.last_signal = f"{signal.action} | {signal.reason}"
 
         self.logger.info(
-            "Signal=%s | close=%s | mark=%s | EMA(%s)=%s | EMA(%s)=%s | EMA(%s)=%s | reason=%s",
+            "Signal=%s | close=%s | mark=%s | EMA(%s)=%s | EMA(%s)=%s | EMA(%s)=%s "
+            "| spread=%s%% | ema99_slope=%s%% | body=%s | distance_ema7=%s%% "
+            "| momentum=%s%% | reason=%s",
             signal.action,
             signal.close_price,
             mark_price,
@@ -758,6 +818,11 @@ class BinanceFuturesBot:
             signal.ema_slow,
             self.config.ema_trend,
             signal.ema_trend,
+            format_decimal(signal.ema_spread_pct),
+            format_decimal(signal.ema_trend_slope_pct),
+            format_decimal(signal.candle_body_ratio),
+            format_decimal(signal.distance_from_ema7_pct),
+            format_decimal(signal.trend_momentum_pct),
             signal.reason,
         )
 
@@ -901,18 +966,55 @@ class BinanceFuturesBot:
             raise RuntimeError("At least three candles are required to evaluate closed-candle signals.")
 
         closed = candles.iloc[:-1].copy()
-        if len(closed) < 2:
-            raise RuntimeError("Not enough closed candles returned to generate a signal.")
+        min_closed_candles = max(
+            2,
+            self.config.ema_slope_lookback + 1,
+            self.config.ema99_slope_lookback + 1,
+            self.config.trend_momentum_lookback + 1,
+        )
+        if len(closed) < min_closed_candles:
+            raise RuntimeError(
+                f"Not enough closed candles returned to generate quality-filtered signal. "
+                f"required={min_closed_candles} received={len(closed)}"
+            )
 
         latest = closed.iloc[-1]
         previous = closed.iloc[-2]
+        ema_slope_reference = closed.iloc[-1 - self.config.ema_slope_lookback]
+        ema99_slope_reference = closed.iloc[-1 - self.config.ema99_slope_lookback]
+        momentum_reference = closed.iloc[-1 - self.config.trend_momentum_lookback]
 
         bullish_latest = latest["close"] > latest["open"]
         bearish_latest = latest["close"] < latest["open"]
         long_previous_touch = self.previous_candle_touched_ema(previous, side="LONG")
         short_previous_touch = self.previous_candle_touched_ema(previous, side="SHORT")
+        close_price = decimal_from_number(latest["close"])
+        ema_fast = decimal_from_number(latest["ema_fast"])
+        ema_slow = decimal_from_number(latest["ema_slow"])
+        ema_trend = decimal_from_number(latest["ema_trend"])
+        candle_range = decimal_from_number(latest["high"]) - decimal_from_number(latest["low"])
+        candle_body = abs(decimal_from_number(latest["close"]) - decimal_from_number(latest["open"]))
+        candle_body_ratio = safe_decimal_ratio(candle_body, candle_range)
+        ema_spread_pct = safe_decimal_ratio(ema_fast - ema_slow, close_price) * Decimal("100")
+        distance_from_ema7_pct = safe_decimal_ratio(abs(close_price - ema_fast), close_price) * Decimal("100")
+        ema_fast_slope_pct = calculate_pct_change(
+            ema_fast,
+            decimal_from_number(ema_slope_reference["ema_fast"]),
+        )
+        ema_slow_slope_pct = calculate_pct_change(
+            ema_slow,
+            decimal_from_number(ema_slope_reference["ema_slow"]),
+        )
+        ema_trend_slope_pct = calculate_pct_change(
+            ema_trend,
+            decimal_from_number(ema99_slope_reference["ema_trend"]),
+        )
+        trend_momentum_pct = calculate_pct_change(
+            close_price,
+            decimal_from_number(momentum_reference["close"]),
+        )
 
-        long_setup = all(
+        long_base_setup = all(
             (
                 latest["close"] > latest["ema_slow"],
                 latest["ema_fast"] > latest["ema_slow"],
@@ -921,7 +1023,7 @@ class BinanceFuturesBot:
                 latest["close"] > previous["close"],
             )
         )
-        short_setup = all(
+        short_base_setup = all(
             (
                 latest["close"] < latest["ema_slow"],
                 latest["ema_fast"] < latest["ema_slow"],
@@ -930,14 +1032,48 @@ class BinanceFuturesBot:
                 latest["close"] < previous["close"],
             )
         )
+        long_quality_failures = self.build_entry_quality_failures(
+            side="LONG",
+            latest=latest,
+            ema_spread_pct=ema_spread_pct,
+            ema_fast_slope_pct=ema_fast_slope_pct,
+            ema_slow_slope_pct=ema_slow_slope_pct,
+            ema_trend_slope_pct=ema_trend_slope_pct,
+            candle_body_ratio=candle_body_ratio,
+            distance_from_ema7_pct=distance_from_ema7_pct,
+            trend_momentum_pct=trend_momentum_pct,
+        )
+        short_quality_failures = self.build_entry_quality_failures(
+            side="SHORT",
+            latest=latest,
+            ema_spread_pct=ema_spread_pct,
+            ema_fast_slope_pct=ema_fast_slope_pct,
+            ema_slow_slope_pct=ema_slow_slope_pct,
+            ema_trend_slope_pct=ema_trend_slope_pct,
+            candle_body_ratio=candle_body_ratio,
+            distance_from_ema7_pct=distance_from_ema7_pct,
+            trend_momentum_pct=trend_momentum_pct,
+        )
+        long_setup = long_base_setup and not long_quality_failures
+        short_setup = short_base_setup and not short_quality_failures
 
         action = "HOLD"
         if long_setup:
-            reason = "Strict bullish confirmation: previous candle touched EMA7/EMA25 and current candle closed bullish above previous close."
+            reason = (
+                "Strict bullish confirmation with quality filters: EMA spread/slope, EMA99 trend, "
+                "body strength, EMA7 distance, and momentum passed."
+            )
             action = "LONG"
         elif short_setup:
-            reason = "Strict bearish confirmation: previous candle touched EMA7/EMA25 and current candle closed bearish below previous close."
+            reason = (
+                "Strict bearish confirmation with quality filters: EMA spread/slope, EMA99 trend, "
+                "body strength, EMA7 distance, and momentum passed."
+            )
             action = "SHORT"
+        elif long_base_setup:
+            reason = "Long quality filters failed: " + "; ".join(long_quality_failures[:4])
+        elif short_base_setup:
+            reason = "Short quality filters failed: " + "; ".join(short_quality_failures[:4])
         else:
             reason = self.build_hold_reason(
                 latest=latest,
@@ -948,16 +1084,6 @@ class BinanceFuturesBot:
                 short_previous_touch=short_previous_touch,
             )
 
-        close_price = decimal_from_number(latest["close"])
-        ema_fast = decimal_from_number(latest["ema_fast"])
-        ema_slow = decimal_from_number(latest["ema_slow"])
-        ema_trend = decimal_from_number(latest["ema_trend"])
-        candle_range = decimal_from_number(latest["high"]) - decimal_from_number(latest["low"])
-        candle_body = abs(decimal_from_number(latest["close"]) - decimal_from_number(latest["open"]))
-        candle_body_ratio = safe_decimal_ratio(candle_body, candle_range)
-        ema_spread_pct = safe_decimal_ratio(ema_fast - ema_slow, close_price) * Decimal("100")
-        distance_from_ema7_pct = safe_decimal_ratio(abs(close_price - ema_fast), close_price) * Decimal("100")
-
         return TradingSignal(
             action=action,
             reason=reason,
@@ -966,8 +1092,12 @@ class BinanceFuturesBot:
             ema_slow=ema_slow,
             ema_trend=ema_trend,
             ema_spread_pct=ema_spread_pct,
+            ema_fast_slope_pct=ema_fast_slope_pct,
+            ema_slow_slope_pct=ema_slow_slope_pct,
+            ema_trend_slope_pct=ema_trend_slope_pct,
             candle_body_ratio=candle_body_ratio,
             distance_from_ema7_pct=distance_from_ema7_pct,
+            trend_momentum_pct=trend_momentum_pct,
             volume=decimal_from_number(latest["volume"]),
             previous_candle_direction=candle_direction(previous),
             candle_close_time=latest["close_time"],
@@ -1909,6 +2039,97 @@ class BinanceFuturesBot:
         )
         return order
 
+    def build_entry_quality_failures(
+        self,
+        side: str,
+        latest: pd.Series,
+        ema_spread_pct: Decimal,
+        ema_fast_slope_pct: Decimal,
+        ema_slow_slope_pct: Decimal,
+        ema_trend_slope_pct: Decimal,
+        candle_body_ratio: Decimal,
+        distance_from_ema7_pct: Decimal,
+        trend_momentum_pct: Decimal,
+    ) -> list[str]:
+        failures: list[str] = []
+        abs_ema_spread_pct = abs(ema_spread_pct)
+        if abs_ema_spread_pct < self.config.min_ema_spread_pct:
+            failures.append(
+                f"EMA7/EMA25 spread too tight "
+                f"({format_decimal(abs_ema_spread_pct)}% < {format_decimal(self.config.min_ema_spread_pct)}%)."
+            )
+
+        if distance_from_ema7_pct > self.config.max_distance_from_ema7_pct:
+            failures.append(
+                f"Late entry: price too far from EMA7 "
+                f"({format_decimal(distance_from_ema7_pct)}% > "
+                f"{format_decimal(self.config.max_distance_from_ema7_pct)}%)."
+            )
+
+        if candle_body_ratio < self.config.min_candle_body_ratio:
+            failures.append(
+                f"Candle body too weak "
+                f"({format_decimal(candle_body_ratio)} < {format_decimal(self.config.min_candle_body_ratio)})."
+            )
+
+        if side == "LONG":
+            if ema_fast_slope_pct < self.config.min_ema_fast_slope_pct:
+                failures.append(
+                    f"EMA7 slope too flat for long "
+                    f"({format_decimal(ema_fast_slope_pct)}% < "
+                    f"{format_decimal(self.config.min_ema_fast_slope_pct)}%)."
+                )
+            if ema_slow_slope_pct < self.config.min_ema_slow_slope_pct:
+                failures.append(
+                    f"EMA25 slope too flat for long "
+                    f"({format_decimal(ema_slow_slope_pct)}% < "
+                    f"{format_decimal(self.config.min_ema_slow_slope_pct)}%)."
+                )
+            if latest["close"] <= latest["ema_trend"]:
+                failures.append("Price is not above EMA99 for long trend confirmation.")
+            if ema_trend_slope_pct < self.config.min_ema99_slope_pct:
+                failures.append(
+                    f"EMA99 slope is not bullish enough "
+                    f"({format_decimal(ema_trend_slope_pct)}% < "
+                    f"{format_decimal(self.config.min_ema99_slope_pct)}%)."
+                )
+            if trend_momentum_pct < self.config.min_trend_momentum_pct:
+                failures.append(
+                    f"Trend momentum too weak for long "
+                    f"({format_decimal(trend_momentum_pct)}% < "
+                    f"{format_decimal(self.config.min_trend_momentum_pct)}%)."
+                )
+            return failures
+
+        if side == "SHORT":
+            if ema_fast_slope_pct > -self.config.min_ema_fast_slope_pct:
+                failures.append(
+                    f"EMA7 slope too flat for short "
+                    f"({format_decimal(ema_fast_slope_pct)}% > -"
+                    f"{format_decimal(self.config.min_ema_fast_slope_pct)}%)."
+                )
+            if ema_slow_slope_pct > -self.config.min_ema_slow_slope_pct:
+                failures.append(
+                    f"EMA25 slope too flat for short "
+                    f"({format_decimal(ema_slow_slope_pct)}% > -"
+                    f"{format_decimal(self.config.min_ema_slow_slope_pct)}%)."
+                )
+            if latest["close"] >= latest["ema_trend"]:
+                failures.append("Price is not below EMA99 for short trend confirmation.")
+            if ema_trend_slope_pct > -self.config.min_ema99_slope_pct:
+                failures.append(
+                    f"EMA99 slope is not bearish enough "
+                    f"({format_decimal(ema_trend_slope_pct)}% > -"
+                    f"{format_decimal(self.config.min_ema99_slope_pct)}%)."
+                )
+            if trend_momentum_pct > -self.config.min_trend_momentum_pct:
+                failures.append(
+                    f"Trend momentum too weak for short "
+                    f"({format_decimal(trend_momentum_pct)}% > -"
+                    f"{format_decimal(self.config.min_trend_momentum_pct)}%)."
+                )
+        return failures
+
     def previous_candle_touched_ema(self, previous: pd.Series, side: str) -> bool:
         if side == "LONG":
             return previous["low"] <= previous["ema_fast"] or previous["low"] <= previous["ema_slow"]
@@ -1962,6 +2183,11 @@ class BinanceFuturesBot:
             f"ema7: {format_decimal(signal.ema_fast)}\n"
             f"ema25: {format_decimal(signal.ema_slow)}\n"
             f"ema99: {format_decimal(signal.ema_trend)}\n"
+            f"ema_spread_pct: {format_decimal(signal.ema_spread_pct)}\n"
+            f"ema99_slope_pct: {format_decimal(signal.ema_trend_slope_pct)}\n"
+            f"candle_body_ratio: {format_decimal(signal.candle_body_ratio)}\n"
+            f"distance_from_ema7_pct: {format_decimal(signal.distance_from_ema7_pct)}\n"
+            f"trend_momentum_pct: {format_decimal(signal.trend_momentum_pct)}\n"
             f"reason: {signal.reason}\n"
             f"mode: {self.config.mode_label}"
         )
@@ -2432,6 +2658,12 @@ def safe_decimal_ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
     if denominator == 0:
         return Decimal("0")
     return numerator / denominator
+
+
+def calculate_pct_change(current: Decimal, previous: Decimal) -> Decimal:
+    if previous == 0:
+        return Decimal("0")
+    return safe_decimal_ratio(current - previous, abs(previous)) * Decimal("100")
 
 
 def candle_direction(candle: pd.Series) -> str:
