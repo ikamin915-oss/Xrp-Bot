@@ -22,6 +22,7 @@ import csv
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -2244,14 +2245,14 @@ def calculate_realized_pnl(
     return Decimal("0")
 
 
-def send_discord_message(content: str) -> None:
+def send_discord_message(message: str) -> None:
     webhook_url = normalize_optional_value(os.getenv("DISCORD_WEBHOOK_URL"))
-    if not webhook_url or not content:
+    if not webhook_url or not message:
         return
     try:
         response = requests.post(
             webhook_url,
-            json=build_discord_webhook_payload(content),
+            json={"content": message},
             timeout=DISCORD_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -2516,10 +2517,23 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def handle_shutdown(signum, frame) -> None:
+    logging.getLogger("main").warning("Shutdown signal received: %s", signum)
+    send_discord_message("⚠️ BOT STOPPED (manual or system shutdown)")
+    sys.exit(0)
+
+
+def register_shutdown_handlers() -> None:
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+
 def main() -> int:
+    crash_alert_sent = False
     try:
         config = BotConfig.from_env()
         configure_logging(config.log_level)
+        register_shutdown_handlers()
         if not config.has_credentials:
             logging.getLogger("main").warning(
                 "API credentials are missing or placeholders are still present. "
@@ -2527,19 +2541,20 @@ def main() -> int:
             )
 
         bot = BinanceFuturesBot(config)
-        bot.run()
+        send_discord_message("✅ BOT STARTED (VPS LIVE)")
+        try:
+            bot.run()
+        except Exception as exc:
+            crash_alert_sent = True
+            logging.getLogger("main").exception("Bot crashed: %s", exc)
+            send_discord_message(f"❌ BOT CRASHED: {str(exc)}")
+            raise
         return 0
-    except KeyboardInterrupt:
-        logging.getLogger("main").info("Execution interrupted by user.")
-        return 130
-    except (ConfigError, ClientError, ServerError, requests.RequestException) as exc:
-        logging.getLogger("main").error("%s", exc)
-        send_discord_message(f"Bot error\n{exc}")
-        return 1
-    except Exception:
-        logging.getLogger("main").exception("Unexpected error while running the bot.")
-        send_discord_message("Bot error\nUnexpected error while running the bot. Check logs.")
-        return 1
+    except Exception as exc:
+        if not crash_alert_sent:
+            logging.getLogger("main").exception("Bot crashed: %s", exc)
+            send_discord_message(f"❌ BOT CRASHED: {str(exc)}")
+        raise
 
 
 if __name__ == "__main__":
