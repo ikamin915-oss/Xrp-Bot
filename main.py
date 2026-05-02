@@ -2252,7 +2252,7 @@ def send_discord_message(message: str) -> None:
     try:
         response = requests.post(
             webhook_url,
-            json={"content": message},
+            json=build_discord_webhook_payload(message),
             timeout=DISCORD_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -2262,7 +2262,8 @@ def send_discord_message(message: str) -> None:
 
 def build_discord_webhook_payload(content: str) -> dict[str, Any]:
     lines = [line.strip() for line in content.splitlines() if line.strip()]
-    title = lines[0] if lines else "Bot update"
+    raw_title = lines[0] if lines else "Bot update"
+    title = format_discord_title(raw_title)
     fields: list[dict[str, Any]] = []
     description_lines: list[str] = []
 
@@ -2293,13 +2294,14 @@ def build_discord_webhook_payload(content: str) -> dict[str, Any]:
     description = "\n".join(description_lines).strip()
     embed: dict[str, Any] = {
         "title": truncate_discord_value(title, 256),
-        "color": discord_color_for_message(title, fields, description),
+        "color": discord_color_for_message(raw_title, fields, description),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "author": {
             "name": "XRPUSDC Scalping Bot",
+            "icon_url": "https://cryptologos.cc/logos/xrp-xrp-logo.png",
         },
         "footer": {
-            "text": "Binance Futures bot | alerts are informational, learning is suggestion-only",
+            "text": "Binance Futures | live-risk alerts | keep bot running for software stops",
         },
     }
     if description:
@@ -2309,9 +2311,35 @@ def build_discord_webhook_payload(content: str) -> dict[str, Any]:
 
     return {
         "username": "XRPUSDC Scalping Bot",
+        "avatar_url": "https://cryptologos.cc/logos/xrp-xrp-logo.png",
         "allowed_mentions": {"parse": []},
         "embeds": [embed],
     }
+
+
+def format_discord_title(title: str) -> str:
+    normalized = title.strip()
+    lowered = normalized.lower()
+    title_icons = (
+        ("bot crashed", "❌"),
+        ("bot stopped", "⚠️"),
+        ("bot started", "✅"),
+        ("entry executed", "🚀"),
+        ("entry sizing prepared", "📐"),
+        ("signal detected", "📡"),
+        ("exit executed", "🏁"),
+        ("partial exit", "🎯"),
+        ("tp1", "🎯"),
+        ("tp2", "🏆"),
+        ("heartbeat", "💓"),
+        ("learning analysis", "🧠"),
+        ("not enough candles", "⚠️"),
+        ("software-managed stops", "🛡️"),
+    )
+    for keyword, icon in title_icons:
+        if keyword in lowered and not normalized.startswith(icon):
+            return f"{icon} {normalized}"
+    return normalized
 
 
 def discord_color_for_message(
