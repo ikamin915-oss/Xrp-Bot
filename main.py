@@ -2523,7 +2523,7 @@ def build_discord_webhook_payload(content: str) -> dict[str, Any]:
         "color": discord_color_for_message(raw_title, fields, description),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "author": {
-            "name": "XRPUSDC Scalping Bot",
+            "name": "MoneyMaker",
             "icon_url": "https://cryptologos.cc/logos/xrp-xrp-logo.png",
         },
         "footer": {
@@ -2536,7 +2536,7 @@ def build_discord_webhook_payload(content: str) -> dict[str, Any]:
         embed["fields"] = fields
 
     return {
-        "username": "XRPUSDC Scalping Bot",
+        "username": "MoneyMaker",
         "avatar_url": "https://cryptologos.cc/logos/xrp-xrp-logo.png",
         "allowed_mentions": {"parse": []},
         "embeds": [embed],
