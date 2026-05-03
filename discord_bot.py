@@ -333,7 +333,7 @@ def build_bot(config: DiscordBotConfig) -> commands.Bot:
             embed=make_embed("Learning analysis started", "Running trade_analyzer.py in suggestion-only mode.", discord.Color.teal()),
             mention_author=False,
         )
-        result = await run_analyzer_subprocess()
+        result = await run_analyzer_subprocess(discord_alert=False)
         if result["returncode"] != 0:
             await ctx.send(
                 embed=make_embed(

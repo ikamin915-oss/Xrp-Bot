@@ -497,8 +497,12 @@ class BinanceFuturesBot:
             self.config.enable_exchange_backup_tp,
             self.config.backup_sl_working_type,
         )
+        if get_bool_env("AUTO_UPGRADE_ENABLED", False):
+            self.logger.info(
+                "Approval-gated upgrade mode is enabled. Scheduled upgrade prompts are delegated to discord_bot.py."
+            )
         self.warn_learning_auto_apply_if_needed()
-        if self.config.analyze_on_start:
+        if self.config.analyze_on_start and not get_bool_env("AUTO_UPGRADE_ENABLED", False):
             self.run_learning_analysis("startup")
         self.logger.info("USE_TESTNET=%s", self.config.use_testnet)
         self.logger.info(
@@ -2491,10 +2495,16 @@ class BinanceFuturesBot:
             return
 
         self.logger.info("Running suggestion-only learning analysis. trigger=%s", trigger)
-        analysis_discord_alert = get_bool_env("ANALYSIS_DISCORD_ALERT", True)
+        auto_upgrade_enabled = get_bool_env("AUTO_UPGRADE_ENABLED", False)
+        analysis_discord_alert = get_bool_env("ANALYSIS_DISCORD_ALERT", True) and not auto_upgrade_enabled
+        if auto_upgrade_enabled:
+            self.logger.info(
+                "Suppressing direct analyzer Discord alerts because approval-gated upgrade flow is handled by discord_bot.py."
+            )
         env = os.environ.copy()
         env["MIN_TRADES_BEFORE_LEARNING"] = str(self.config.min_trades_before_learning)
         env["AUTO_APPLY_LEARNING"] = "true" if self.config.auto_apply_learning else "false"
+        env["AUTO_UPGRADE_ENABLED"] = "true" if auto_upgrade_enabled else "false"
         env["ANALYSIS_DISCORD_ALERT"] = "true" if analysis_discord_alert else "false"
 
         try:
@@ -2528,6 +2538,8 @@ class BinanceFuturesBot:
         self.logger.info("Learning analyzer completed. Discord completion alert is handled by trade_analyzer.py.")
 
     def maybe_run_scheduled_learning_analysis(self) -> None:
+        if get_bool_env("AUTO_UPGRADE_ENABLED", False):
+            return
         if self.config.auto_analyze_every_hours <= 0:
             return
 

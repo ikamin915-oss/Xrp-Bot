@@ -767,20 +767,34 @@ def send_discord_embed(
         logging.getLogger("trade_analyzer").error("Discord learning alert failed: %s", exc)
 
 
-def send_analysis_started_alert(min_trades: int, auto_apply_learning: bool) -> None:
+def send_analysis_started_alert(
+    min_trades: int,
+    auto_apply_learning: bool,
+    auto_upgrade_enabled: bool,
+) -> None:
+    approval_field_name = "Approval" if auto_upgrade_enabled else "Auto Apply"
+    approval_field_value = (
+        "Discord DM approval required"
+        if auto_upgrade_enabled
+        else ("disabled for safety" if auto_apply_learning else "false")
+    )
     send_discord_embed(
         title="🧠 Learning analysis started",
         fields=[
             discord_field("Minimum Trades", min_trades, inline=True),
-            discord_field("Auto Apply", "disabled for safety" if auto_apply_learning else "false", inline=True),
+            discord_field(approval_field_name, approval_field_value, inline=True),
             discord_field("Report", "learning_report.md", inline=True),
         ],
-        description="Reading trades.csv and bot logs for suggestion-only review.",
+        description=(
+            "Reading trades.csv and bot logs for suggestion-only review."
+            if not auto_upgrade_enabled
+            else "Reading trades.csv and bot logs. Any safe upgrade still requires Discord approval."
+        ),
         color=DISCORD_LEARNING_COLOR,
     )
 
 
-def send_analysis_completed_alert(state: dict[str, Any]) -> None:
+def send_analysis_completed_alert(state: dict[str, Any], auto_upgrade_enabled: bool) -> None:
     metrics = state.get("metrics", {})
     recommendations = state.get("recommended_parameter_changes", [])
     insights = top_learning_insights(state)
@@ -798,6 +812,7 @@ def send_analysis_completed_alert(state: dict[str, Any]) -> None:
             discord_field("Total PnL", total_pnl, inline=True),
             discord_field("Suggestions Exist", "yes" if recommendations else "no", inline=True),
             discord_field("Env Update Recommended", "yes" if recommendations else "no", inline=True),
+            discord_field("Approval Required", "yes" if auto_upgrade_enabled else "no", inline=True),
             discord_field("Top Losing Patterns", summarize_patterns_for_discord(state), inline=False),
             discord_field("Suggested Stricter Filters", summarize_recommendations_for_discord(state), inline=False),
         ],
@@ -857,12 +872,17 @@ def main() -> int:
     load_dotenv(dotenv_path=ENV_PATH, override=False)
     min_trades = int(os.getenv("MIN_TRADES_BEFORE_LEARNING", "20"))
     auto_apply_learning = parse_bool(os.getenv("AUTO_APPLY_LEARNING"), False)
+    auto_upgrade_enabled = parse_bool(os.getenv("AUTO_UPGRADE_ENABLED"), False)
     analysis_discord_alert = parse_bool(os.getenv("ANALYSIS_DISCORD_ALERT"), True)
     if auto_apply_learning:
         print("Auto-apply learning is disabled for safety.")
 
     if analysis_discord_alert:
-        send_analysis_started_alert(min_trades=min_trades, auto_apply_learning=auto_apply_learning)
+        send_analysis_started_alert(
+            min_trades=min_trades,
+            auto_apply_learning=auto_apply_learning,
+            auto_upgrade_enabled=auto_upgrade_enabled,
+        )
 
     frame = load_trades()
     if frame.empty:
@@ -898,7 +918,7 @@ def main() -> int:
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     write_suggested_upgrade_files(state)
     if analysis_discord_alert:
-        send_analysis_completed_alert(state)
+        send_analysis_completed_alert(state, auto_upgrade_enabled=auto_upgrade_enabled)
     print(f"Learning report written to {REPORT_PATH}")
     print(f"Learning state written to {STATE_PATH}")
     print(f"Suggested env update written to {SUGGESTED_ENV_UPDATE_PATH}")
