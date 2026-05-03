@@ -2115,9 +2115,11 @@ class BinanceFuturesBot:
             return
 
         self.logger.info("Running suggestion-only learning analysis. trigger=%s", trigger)
+        analysis_discord_alert = get_bool_env("ANALYSIS_DISCORD_ALERT", True)
         env = os.environ.copy()
         env["MIN_TRADES_BEFORE_LEARNING"] = str(self.config.min_trades_before_learning)
         env["AUTO_APPLY_LEARNING"] = "true" if self.config.auto_apply_learning else "false"
+        env["ANALYSIS_DISCORD_ALERT"] = "true" if analysis_discord_alert else "false"
 
         try:
             result = subprocess.run(
@@ -2131,7 +2133,8 @@ class BinanceFuturesBot:
             )
         except Exception as exc:
             self.logger.warning("Learning analysis could not run: %s", exc)
-            send_discord_message(f"Learning analysis failed\ntrigger: {trigger}\nerror: {exc}")
+            if analysis_discord_alert:
+                send_discord_message(f"Learning analysis failed\ntrigger: {trigger}\nerror: {exc}")
             return
 
         if result.stdout.strip():
@@ -2140,12 +2143,13 @@ class BinanceFuturesBot:
             self.logger.warning("Learning analyzer stderr: %s", result.stderr.strip())
         if result.returncode != 0:
             self.logger.warning("Learning analyzer exited with code %s.", result.returncode)
-            send_discord_message(
-                f"Learning analysis failed\ntrigger: {trigger}\nexit_code: {result.returncode}"
-            )
+            if analysis_discord_alert:
+                send_discord_message(
+                    f"Learning analysis failed\ntrigger: {trigger}\nexit_code: {result.returncode}"
+                )
             return
 
-        send_discord_message(self.build_learning_discord_summary(trigger))
+        self.logger.info("Learning analyzer completed. Discord completion alert is handled by trade_analyzer.py.")
 
     def build_learning_discord_summary(self, trigger: str) -> str:
         if not LEARNING_STATE_PATH.exists():

@@ -8,12 +8,14 @@ learning_state.json. It never changes live trading settings.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 
@@ -27,6 +29,10 @@ BOT_LOG_PATHS = [
     PROJECT_DIR / "main.log",
     PROJECT_DIR / "logs" / "bot.log",
 ]
+DISCORD_TIMEOUT_SECONDS = 10
+DISCORD_LEARNING_COLOR = 0x1ABC9C
+DISCORD_WARNING_COLOR = 0xF1C40F
+DISCORD_MAX_FIELD_VALUE_LENGTH = 1024
 
 NUMERIC_COLUMNS = [
     "entry_price",
@@ -601,12 +607,126 @@ def empty_outputs(min_trades: int, auto_apply_learning: bool) -> tuple[str, dict
     return report, state
 
 
+def send_discord_embed(
+    title: str,
+    fields: list[dict[str, Any]] | None = None,
+    description: str = "",
+    color: int = DISCORD_LEARNING_COLOR,
+) -> None:
+    webhook_url = normalize_optional_value(os.getenv("DISCORD_WEBHOOK_URL"))
+    if not webhook_url:
+        return
+
+    embed: dict[str, Any] = {
+        "title": title,
+        "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {
+            "text": "MoneyMaker learning module | suggestion-only, never auto-applied",
+        },
+    }
+    if description:
+        embed["description"] = description[:3900]
+    if fields:
+        embed["fields"] = fields[:25]
+
+    try:
+        response = requests.post(
+            webhook_url,
+            json={
+                "username": "MoneyMaker",
+                "allowed_mentions": {"parse": []},
+                "embeds": [embed],
+            },
+            timeout=DISCORD_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logging.getLogger("trade_analyzer").error("Discord learning alert failed: %s", exc)
+
+
+def send_analysis_started_alert(min_trades: int, auto_apply_learning: bool) -> None:
+    send_discord_embed(
+        title="🧠 Learning analysis started",
+        fields=[
+            discord_field("Minimum Trades", min_trades, inline=True),
+            discord_field("Auto Apply", "disabled for safety" if auto_apply_learning else "false", inline=True),
+            discord_field("Report", "learning_report.md", inline=True),
+        ],
+        description="Reading trades.csv and bot logs for suggestion-only review.",
+        color=DISCORD_LEARNING_COLOR,
+    )
+
+
+def send_analysis_completed_alert(state: dict[str, Any]) -> None:
+    metrics = state.get("metrics", {})
+    recommendations = state.get("recommended_parameter_changes", [])
+    insights = top_learning_insights(state)
+    description = "No top insights detected yet."
+    if insights:
+        description = "\n".join(f"{index}. {insight}" for index, insight in enumerate(insights, start=1))
+
+    send_discord_embed(
+        title="🧠 Learning analysis completed",
+        fields=[
+            discord_field("Total Trades", metrics.get("total_trades", 0), inline=True),
+            discord_field("Win Rate", f"{metrics.get('win_rate_pct', 0)}%", inline=True),
+            discord_field("Profit Factor", metrics.get("profit_factor", 0), inline=True),
+            discord_field("Suggestions Exist", "yes" if recommendations else "no", inline=True),
+            discord_field("Suggested Only", str(state.get("suggested_only", True)).lower(), inline=True),
+            discord_field("Enough Trades", str(state.get("enough_trades_for_learning", False)).lower(), inline=True),
+        ],
+        description=description,
+        color=DISCORD_LEARNING_COLOR if recommendations else DISCORD_WARNING_COLOR,
+    )
+
+
+def top_learning_insights(state: dict[str, Any]) -> list[str]:
+    patterns = state.get("detected_losing_patterns", [])
+    insights: list[str] = []
+    for pattern in patterns[:3]:
+        name = pattern.get("pattern", "Losing pattern")
+        loss_count = pattern.get("loss_count", 0)
+        loss_share = pattern.get("loss_share_pct", 0)
+        suggestion = pattern.get("suggestion", "Review this setup.")
+        insights.append(f"{name}: {loss_count} loss(es), {loss_share}% of losses. {suggestion}")
+
+    if insights:
+        return insights[:3]
+
+    recommendations = state.get("recommended_parameter_changes", [])
+    for recommendation in recommendations[:3]:
+        parameter = recommendation.get("parameter", "filter")
+        reason = recommendation.get("reason", "Review suggested filter.")
+        insights.append(f"{parameter}: {reason}")
+    return insights[:3]
+
+
+def discord_field(name: str, value: Any, inline: bool = False) -> dict[str, Any]:
+    return {
+        "name": name,
+        "value": f"`{str(value)[:DISCORD_MAX_FIELD_VALUE_LENGTH - 2]}`",
+        "inline": inline,
+    }
+
+
+def normalize_optional_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
 def main() -> int:
     load_dotenv(dotenv_path=ENV_PATH, override=False)
     min_trades = int(os.getenv("MIN_TRADES_BEFORE_LEARNING", "20"))
     auto_apply_learning = parse_bool(os.getenv("AUTO_APPLY_LEARNING"), False)
+    analysis_discord_alert = parse_bool(os.getenv("ANALYSIS_DISCORD_ALERT"), True)
     if auto_apply_learning:
         print("Auto-apply learning is disabled for safety.")
+
+    if analysis_discord_alert:
+        send_analysis_started_alert(min_trades=min_trades, auto_apply_learning=auto_apply_learning)
 
     frame = load_trades()
     if frame.empty:
@@ -640,6 +760,8 @@ def main() -> int:
 
     REPORT_PATH.write_text(report, encoding="utf-8")
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    if analysis_discord_alert:
+        send_analysis_completed_alert(state)
     print(f"Learning report written to {REPORT_PATH}")
     print(f"Learning state written to {STATE_PATH}")
     return 0
