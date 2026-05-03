@@ -186,6 +186,8 @@ class BotConfig:
     enable_exchange_backup_sl: bool
     enable_exchange_backup_tp: bool
     backup_sl_working_type: str
+    enable_macro_filter: bool
+    macro_interval: str
 
     @property
     def has_credentials(self) -> bool:
@@ -274,6 +276,8 @@ class BotConfig:
             enable_exchange_backup_sl=get_bool_env("ENABLE_EXCHANGE_BACKUP_SL", True),
             enable_exchange_backup_tp=get_bool_env("ENABLE_EXCHANGE_BACKUP_TP", False),
             backup_sl_working_type=get_env("BACKUP_SL_WORKING_TYPE", "MARK_PRICE").upper(),
+            enable_macro_filter=get_bool_env("ENABLE_MACRO_FILTER", True),
+            macro_interval=get_env("MACRO_INTERVAL", "10m"),
         )
         config.validate()
         return config
@@ -333,6 +337,11 @@ class BotConfig:
             raise ConfigError("MIN_TRADES_BEFORE_LEARNING must be greater than 0.")
         if self.backup_sl_working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
             raise ConfigError("BACKUP_SL_WORKING_TYPE must be MARK_PRICE or CONTRACT_PRICE.")
+        if self.macro_interval not in SUPPORTED_INTERVALS and self.macro_interval != "10m":
+            raise ConfigError(
+                f"Unsupported MACRO_INTERVAL '{self.macro_interval}'. Use one of: "
+                f"{', '.join(sorted(SUPPORTED_INTERVALS | {'10m'}))}"
+            )
         if not self.dry_run and self.confirm_live and not self.has_credentials:
             raise ConfigError(
                 "Non-dry-run trading requires BINANCE_API_KEY and BINANCE_API_SECRET in .env."
@@ -380,6 +389,13 @@ class TradingSignal:
     volume: Decimal
     previous_candle_direction: str
     candle_close_time: pd.Timestamp
+
+
+@dataclass(frozen=True)
+class MacroTrendSnapshot:
+    btc_trend: str
+    eth_trend: str
+    decision: str
 
 
 @dataclass
@@ -459,6 +475,7 @@ class BinanceFuturesBot:
         self.backup_sl_algo_id: Optional[str] = None
         self.backup_tp_algo_id: Optional[str] = None
         self.last_backup_algo_warning_key: Optional[str] = None
+        self.last_macro_summary = "Macro filter: BTC trend = unknown | ETH trend = unknown | Decision = not checked"
         self.load_daily_state()
 
     def run(self) -> None:
@@ -497,6 +514,11 @@ class BinanceFuturesBot:
             self.config.enable_exchange_backup_sl,
             self.config.enable_exchange_backup_tp,
             self.config.backup_sl_working_type,
+        )
+        self.logger.info(
+            "Macro filter settings: ENABLE_MACRO_FILTER=%s MACRO_INTERVAL=%s",
+            self.config.enable_macro_filter,
+            self.config.macro_interval,
         )
         if get_bool_env("AUTO_UPGRADE_ENABLED", False):
             self.logger.info(
@@ -794,6 +816,8 @@ class BinanceFuturesBot:
             return
 
         signal = self.generate_signal(candles)
+        macro_snapshot = self.fetch_macro_trend_snapshot()
+        signal = self.apply_macro_filter(signal, macro_snapshot)
         self.last_signal = f"{signal.action} | {signal.reason}"
 
         self.logger.info(
@@ -863,37 +887,79 @@ class BinanceFuturesBot:
         self.open_position(signal, planned_quantity, mark_price, sizing_plan)
 
     def fetch_candles(self) -> Optional[pd.DataFrame]:
-        min_required = self.config.ema_trend + 3
+        frame = self.fetch_market_candles(
+            symbol=self.config.symbol,
+            interval=self.config.interval,
+            limit=self.config.candle_limit,
+            min_required=self.config.ema_trend + 3,
+            warning_prefix="Not enough candles returned; skipping cycle.",
+        )
+        if frame is not None:
+            self.last_candle_fetch_warning = ""
+        return frame
+
+    def build_candle_frame(self, raw_klines: list[list[Any]]) -> pd.DataFrame:
+        frame = self.build_price_frame(raw_klines)
+        return self.apply_indicator_columns(frame)
+
+    def build_price_frame(self, raw_klines: list[list[Any]]) -> pd.DataFrame:
+        frame = pd.DataFrame(raw_klines, columns=KLINE_COLUMNS)
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = frame[column].astype(float)
+
+        frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+        frame["close_time"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
+        return frame
+
+    def apply_indicator_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.copy()
+        frame["ema_fast"] = frame["close"].ewm(span=self.config.ema_fast, adjust=False).mean()
+        frame["ema_slow"] = frame["close"].ewm(span=self.config.ema_slow, adjust=False).mean()
+        frame["ema_trend"] = frame["close"].ewm(span=self.config.ema_trend, adjust=False).mean()
+        return frame
+
+    def fetch_market_candles(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        min_required: int,
+        warning_prefix: str,
+    ) -> Optional[pd.DataFrame]:
         last_count = 0
         last_error: Optional[Exception] = None
 
         for attempt in range(1, CANDLE_FETCH_MAX_ATTEMPTS + 1):
             try:
                 raw_klines = self.client.klines(
-                    symbol=self.config.symbol,
-                    interval=self.config.interval,
-                    limit=self.config.candle_limit,
+                    symbol=symbol,
+                    interval=interval,
+                    limit=limit,
                 )
                 last_error = None
                 last_count = len(raw_klines)
                 if last_count >= min_required:
-                    self.last_candle_fetch_warning = ""
                     return self.build_candle_frame(raw_klines)
 
                 self.logger.warning(
-                    "Not enough candles returned from Binance. attempt=%s/%s received=%s required=%s limit=%s",
+                    "%s symbol=%s interval=%s attempt=%s/%s received=%s required=%s limit=%s",
+                    warning_prefix,
+                    symbol,
+                    interval,
                     attempt,
                     CANDLE_FETCH_MAX_ATTEMPTS,
                     last_count,
                     min_required,
-                    self.config.candle_limit,
+                    limit,
                 )
             except Exception as exc:
                 last_error = exc
                 self.logger.warning(
-                    "Candle fetch attempt %s/%s failed: %s",
+                    "Candle fetch attempt %s/%s failed for %s %s: %s",
                     attempt,
                     CANDLE_FETCH_MAX_ATTEMPTS,
+                    symbol,
+                    interval,
                     format_exception_for_log(exc),
                 )
 
@@ -901,34 +967,25 @@ class BinanceFuturesBot:
                 time.sleep(CANDLE_FETCH_RETRY_SECONDS)
 
         if last_error is not None:
-            self.last_candle_fetch_warning = (
-                "Candle fetch failed after retries; skipping cycle. "
-                f"last_error={format_exception_for_log(last_error)}"
+            self.logger.warning(
+                "%s symbol=%s interval=%s last_error=%s",
+                warning_prefix,
+                symbol,
+                interval,
+                format_exception_for_log(last_error),
             )
-            self.logger.warning(self.last_candle_fetch_warning)
             return None
 
-        self.last_candle_fetch_warning = "Not enough candles returned; skipping cycle."
         self.logger.warning(
-            "%s received=%s required=%s limit=%s",
-            self.last_candle_fetch_warning,
+            "%s symbol=%s interval=%s received=%s required=%s limit=%s",
+            warning_prefix,
+            symbol,
+            interval,
             last_count,
             min_required,
-            self.config.candle_limit,
+            limit,
         )
         return None
-
-    def build_candle_frame(self, raw_klines: list[list[Any]]) -> pd.DataFrame:
-        frame = pd.DataFrame(raw_klines, columns=KLINE_COLUMNS)
-        for column in ("open", "high", "low", "close", "volume"):
-            frame[column] = frame[column].astype(float)
-
-        frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-        frame["close_time"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
-        frame["ema_fast"] = frame["close"].ewm(span=self.config.ema_fast, adjust=False).mean()
-        frame["ema_slow"] = frame["close"].ewm(span=self.config.ema_slow, adjust=False).mean()
-        frame["ema_trend"] = frame["close"].ewm(span=self.config.ema_trend, adjust=False).mean()
-        return frame
 
     def handle_candle_fetch_skip(self, mark_price: Decimal, position: Position) -> None:
         warning = self.last_candle_fetch_warning or "Not enough candles returned; skipping cycle."
@@ -944,6 +1001,160 @@ class BinanceFuturesBot:
         self.logger.warning(message.replace("\n", " | "))
         send_discord_message(message)
         self.maybe_send_heartbeat(mark_price, position)
+
+    def fetch_macro_trend_snapshot(self) -> Optional[MacroTrendSnapshot]:
+        if not self.config.enable_macro_filter:
+            self.last_macro_summary = "Macro filter: disabled"
+            return MacroTrendSnapshot(btc_trend="disabled", eth_trend="disabled", decision="allowed")
+
+        btc_frame = self.fetch_macro_candles("BTCUSDC")
+        if btc_frame is None:
+            self.last_macro_summary = "Macro filter: BTC trend = unavailable | ETH trend = unknown | Decision = rejected"
+            self.logger.warning("Macro filter data unavailable for BTCUSDC. Skipping trade.")
+            return None
+
+        eth_frame = self.fetch_macro_candles("ETHUSDC")
+        if eth_frame is None:
+            self.last_macro_summary = "Macro filter: BTC trend = unknown | ETH trend = unavailable | Decision = rejected"
+            self.logger.warning("Macro filter data unavailable for ETHUSDC. Skipping trade.")
+            return None
+
+        btc_trend = self.macro_trend_from_candles(btc_frame)
+        eth_trend = self.macro_trend_from_candles(eth_frame)
+        return MacroTrendSnapshot(btc_trend=btc_trend, eth_trend=eth_trend, decision="pending")
+
+    def fetch_macro_candles(self, symbol: str) -> Optional[pd.DataFrame]:
+        if self.config.macro_interval == "10m":
+            source_limit = max((self.config.ema_slow + 4) * 2, self.config.candle_limit)
+            source_frame = self.fetch_market_candles(
+                symbol=symbol,
+                interval="5m",
+                limit=source_limit,
+                min_required=self.config.ema_slow + 6,
+                warning_prefix="Macro candle fetch failed",
+            )
+            if source_frame is None:
+                return None
+            macro_frame = self.resample_macro_frame(source_frame, rule="10min")
+            if len(macro_frame) < self.config.ema_slow + 3:
+                self.logger.warning(
+                    "Macro candle fetch failed symbol=%s interval=%s resampled=%s required=%s",
+                    symbol,
+                    self.config.macro_interval,
+                    len(macro_frame),
+                    self.config.ema_slow + 3,
+                )
+                return None
+            return macro_frame
+
+        return self.fetch_market_candles(
+            symbol=symbol,
+            interval=self.config.macro_interval,
+            limit=max(self.config.candle_limit, self.config.ema_slow + 6),
+            min_required=self.config.ema_slow + 3,
+            warning_prefix="Macro candle fetch failed",
+        )
+
+    def resample_macro_frame(self, source_frame: pd.DataFrame, rule: str) -> pd.DataFrame:
+        frame = source_frame[["open_time", "close_time", "open", "high", "low", "close", "volume"]].copy()
+        frame = frame.set_index("open_time")
+        resampled = frame.resample(rule, label="left", closed="left").agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+                "close_time": "last",
+            }
+        )
+        resampled = resampled.dropna(subset=["open", "high", "low", "close"]).reset_index()
+        return self.apply_indicator_columns(resampled)
+
+    def macro_trend_from_candles(self, candles: pd.DataFrame) -> str:
+        closed = candles.iloc[:-1].copy()
+        if closed.empty:
+            raise RuntimeError("Not enough closed macro candles returned.")
+        latest = closed.iloc[-1]
+        if latest["ema_fast"] > latest["ema_slow"]:
+            return "bullish"
+        if latest["ema_fast"] < latest["ema_slow"]:
+            return "bearish"
+        return "flat"
+
+    def apply_macro_filter(
+        self,
+        signal: TradingSignal,
+        macro_snapshot: Optional[MacroTrendSnapshot],
+    ) -> TradingSignal:
+        if not self.config.enable_macro_filter:
+            self.last_macro_summary = "Macro filter: disabled"
+            return signal
+
+        if macro_snapshot is None:
+            if signal.action != "HOLD":
+                return TradingSignal(
+                    action="HOLD",
+                    reason=f"{signal.reason} Macro filter data unavailable; skipping trade.",
+                    close_price=signal.close_price,
+                    ema_fast=signal.ema_fast,
+                    ema_slow=signal.ema_slow,
+                    ema_trend=signal.ema_trend,
+                    ema_spread_pct=signal.ema_spread_pct,
+                    candle_body_ratio=signal.candle_body_ratio,
+                    distance_from_ema7_pct=signal.distance_from_ema7_pct,
+                    volume=signal.volume,
+                    previous_candle_direction=signal.previous_candle_direction,
+                    candle_close_time=signal.candle_close_time,
+                )
+            return signal
+
+        decision = "allowed"
+        if signal.action == "LONG":
+            decision = (
+                "allowed"
+                if macro_snapshot.btc_trend == "bullish" and macro_snapshot.eth_trend == "bullish"
+                else "rejected"
+            )
+        elif signal.action == "SHORT":
+            decision = (
+                "allowed"
+                if macro_snapshot.btc_trend == "bearish" and macro_snapshot.eth_trend == "bearish"
+                else "rejected"
+            )
+        else:
+            decision = "rejected"
+
+        self.last_macro_summary = (
+            f"Macro filter: BTC trend = {macro_snapshot.btc_trend} | "
+            f"ETH trend = {macro_snapshot.eth_trend} | Decision = {decision}"
+        )
+        self.logger.info(
+            "Macro filter: BTC trend = %s | ETH trend = %s | Decision = %s",
+            macro_snapshot.btc_trend,
+            macro_snapshot.eth_trend,
+            decision,
+        )
+
+        if signal.action in {"LONG", "SHORT"} and decision == "rejected":
+            return TradingSignal(
+                action="HOLD",
+                reason=(
+                    f"{signal.reason} Macro filter rejected: BTC {macro_snapshot.btc_trend}, "
+                    f"ETH {macro_snapshot.eth_trend}."
+                ),
+                close_price=signal.close_price,
+                ema_fast=signal.ema_fast,
+                ema_slow=signal.ema_slow,
+                ema_trend=signal.ema_trend,
+                ema_spread_pct=signal.ema_spread_pct,
+                candle_body_ratio=signal.candle_body_ratio,
+                distance_from_ema7_pct=signal.distance_from_ema7_pct,
+                volume=signal.volume,
+                previous_candle_direction=signal.previous_candle_direction,
+                candle_close_time=signal.candle_close_time,
+            )
+        return signal
 
     def generate_signal(self, candles: pd.DataFrame) -> TradingSignal:
         if len(candles) < 3:
@@ -2380,6 +2591,7 @@ class BinanceFuturesBot:
             f"trades_today: {self.trades_today}",
             f"losses_today: {self.losses_today}",
             f"last signal: {self.last_signal}",
+            f"macro filter: {self.last_macro_summary}",
             f"paused: {'yes' if self.is_paused() else 'no'}",
             f"dry-run/live status: {self.config.mode_label}",
         ]
