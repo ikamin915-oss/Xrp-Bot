@@ -458,6 +458,7 @@ class BinanceFuturesBot:
         self.last_candle_fetch_warning = "Not enough candles returned; skipping cycle."
         self.backup_sl_algo_id: Optional[str] = None
         self.backup_tp_algo_id: Optional[str] = None
+        self.last_backup_algo_warning_key: Optional[str] = None
         self.load_daily_state()
 
     def run(self) -> None:
@@ -1297,6 +1298,14 @@ class BinanceFuturesBot:
                 self.cancel_algo_order(existing, reason="replace backup SL")
             self.place_exchange_backup_sl(position, stop_price, break_even=break_even)
         except Exception as exc:
+            if self.handle_existing_backup_algo_conflict(
+                position=position,
+                trigger_price=stop_price,
+                order_type="STOP_MARKET",
+                exc=exc,
+                break_even=break_even,
+            ):
+                return
             self.handle_backup_algo_failure("backup SL failed", exc)
 
     def ensure_exchange_backup_tp2(self, position: Position) -> None:
@@ -1313,6 +1322,14 @@ class BinanceFuturesBot:
                 self.cancel_algo_order(existing, reason="replace backup TP2")
             self.place_exchange_backup_tp2(position, tp2_price)
         except Exception as exc:
+            if self.handle_existing_backup_algo_conflict(
+                position=position,
+                trigger_price=tp2_price,
+                order_type="TAKE_PROFIT_MARKET",
+                exc=exc,
+                break_even=False,
+            ):
+                return
             self.handle_backup_algo_failure("backup TP2 failed", exc)
 
     def place_exchange_backup_sl(
@@ -1383,12 +1400,65 @@ class BinanceFuturesBot:
                 break_even=True,
             )
         except Exception as exc:
+            if self.handle_existing_backup_algo_conflict(
+                position=position,
+                trigger_price=self.calculate_stop_price(position, break_even=True),
+                order_type="STOP_MARKET",
+                exc=exc,
+                break_even=True,
+            ):
+                return
             self.handle_backup_algo_failure("backup SL failed", exc)
+
+    def handle_existing_backup_algo_conflict(
+        self,
+        position: Position,
+        trigger_price: Decimal,
+        order_type: str,
+        exc: Exception,
+        break_even: bool,
+    ) -> bool:
+        if not is_existing_gte_close_position_error(exc):
+            return False
+
+        existing = self.find_open_backup_algo_order(order_type, close_side_for_position(position))
+        if existing:
+            algo_id = get_algo_order_id(existing)
+            if order_type == "STOP_MARKET":
+                self.backup_sl_algo_id = algo_id
+            else:
+                self.backup_tp_algo_id = algo_id
+            self.logger.info(
+                "Exchange reported an existing backup %s algo order. Reusing algoId=%s trigger=%s.",
+                order_type,
+                algo_id,
+                format_decimal(trigger_price),
+            )
+            return True
+
+        warning_key = (
+            f"{build_position_key(position)}:{order_type}:{format_decimal(trigger_price)}:"
+            f"{'BE' if break_even else 'INIT'}"
+        )
+        if self.last_backup_algo_warning_key == warning_key:
+            self.logger.info(
+                "Suppressing duplicate backup %s warning because Binance already reported an existing conditional order.",
+                order_type,
+            )
+            return True
+
+        self.last_backup_algo_warning_key = warning_key
+        self.logger.warning(
+            "Binance reported an existing backup %s conditional order, but it was not visible via openAlgoOrders yet. "
+            "Software-managed SL/TP remains active.",
+            order_type,
+        )
+        return True
 
     def find_open_backup_algo_order(self, order_type: str, side: str) -> Optional[dict[str, Any]]:
         orders = self.get_open_algo_orders()
         for order in orders:
-            if str(order.get("type", "")).upper() != order_type:
+            if normalize_algo_order_type(order) != order_type:
                 continue
             if str(order.get("side", "")).upper() != side:
                 continue
@@ -2625,7 +2695,24 @@ def close_side_for_position(position: Position) -> str:
 
 def algo_order_closes_position(order: dict[str, Any]) -> bool:
     value = order.get("closePosition")
-    return value is True or str(value).strip().lower() == "true"
+    return value is True or str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def normalize_algo_order_type(order: dict[str, Any]) -> str:
+    fields = [
+        order.get("type"),
+        order.get("origType"),
+        order.get("stopType"),
+        order.get("triggerType"),
+        order.get("strategyType"),
+        order.get("algoType"),
+    ]
+    text = " ".join(str(value).upper() for value in fields if value is not None)
+    if "TAKE_PROFIT" in text:
+        return "TAKE_PROFIT_MARKET"
+    if "STOP" in text or "CONDITIONAL" in text:
+        return "STOP_MARKET"
+    return ""
 
 
 def algo_order_trigger_matches(order: dict[str, Any], expected_price: Decimal) -> bool:
@@ -2638,6 +2725,11 @@ def algo_order_trigger_matches(order: dict[str, Any], expected_price: Decimal) -
         except InvalidOperation:
             return False
     return False
+
+
+def is_existing_gte_close_position_error(exc: Exception) -> bool:
+    message = format_exception_for_log(exc).lower()
+    return "-4130" in message and "closeposition" in message and "existing" in message
 
 
 def is_reduce_only_order(order: dict[str, Any]) -> bool:
