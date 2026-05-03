@@ -19,6 +19,8 @@ This example assumes one-way mode on Binance Futures.
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -46,15 +48,18 @@ except ImportError:  # pragma: no cover - requirements.txt includes certifi.
     certifi = None
 
 
-FUTURES_LIVE_URL = "https://fapi.binance.com"
+FUTURES_LIVE_URL = "https://fapi.binance.me"
 FUTURES_TESTNET_URL = "https://demo-fapi.binance.com"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
 BOT_LOG_PATH = PROJECT_DIR / "bot.log"
 TRADES_CSV_PATH = PROJECT_DIR / "trades.csv"
+DAILY_STATE_PATH = PROJECT_DIR / "daily_state.json"
 TRADE_ANALYZER_PATH = PROJECT_DIR / "trade_analyzer.py"
 LEARNING_REPORT_PATH = PROJECT_DIR / "learning_report.md"
 LEARNING_STATE_PATH = PROJECT_DIR / "learning_state.json"
+PAUSED_LOCK_PATH = PROJECT_DIR / "PAUSED.lock"
+BOT_LOCK_PATH = PROJECT_DIR / "bot.lock"
 FUTURES_TESTNET_KEYS_ERROR = (
     "Your keys are not valid for Binance Futures Demo/Testnet. "
     "Create new USD-M Futures Demo API keys and put them in .env."
@@ -121,6 +126,9 @@ CANDLE_FETCH_MAX_ATTEMPTS = 3
 CANDLE_FETCH_RETRY_SECONDS = 3
 MAX_ALLOWED_LEVERAGE = 7
 WALLET_BALANCE_ASSET = "USDC"
+ALGO_ORDER_PATH = "/fapi/v1/algoOrder"
+OPEN_ALGO_ORDERS_PATH = "/fapi/v1/openAlgoOrders"
+ALL_OPEN_ALGO_ORDERS_PATH = "/fapi/v1/algoOpenOrders"
 DISCORD_EMBED_COLORS = {
     "success": 0x2ECC71,
     "info": 0x3498DB,
@@ -172,8 +180,12 @@ class BotConfig:
     max_daily_profit_usdt: Decimal
     stop_after_losses: int
     analyze_on_start: bool
+    auto_analyze_every_hours: int
     auto_apply_learning: bool
     min_trades_before_learning: int
+    enable_exchange_backup_sl: bool
+    enable_exchange_backup_tp: bool
+    backup_sl_working_type: str
 
     @property
     def has_credentials(self) -> bool:
@@ -256,8 +268,12 @@ class BotConfig:
             max_daily_profit_usdt=get_decimal_env("MAX_DAILY_PROFIT_USDT", "1.00"),
             stop_after_losses=get_int_env("STOP_AFTER_LOSSES", 2),
             analyze_on_start=get_bool_env("ANALYZE_ON_START", False),
+            auto_analyze_every_hours=get_int_env("AUTO_ANALYZE_EVERY_HOURS", 12),
             auto_apply_learning=get_bool_env("AUTO_APPLY_LEARNING", False),
             min_trades_before_learning=get_int_env("MIN_TRADES_BEFORE_LEARNING", 20),
+            enable_exchange_backup_sl=get_bool_env("ENABLE_EXCHANGE_BACKUP_SL", True),
+            enable_exchange_backup_tp=get_bool_env("ENABLE_EXCHANGE_BACKUP_TP", False),
+            backup_sl_working_type=get_env("BACKUP_SL_WORKING_TYPE", "MARK_PRICE").upper(),
         )
         config.validate()
         return config
@@ -311,8 +327,12 @@ class BotConfig:
             raise ConfigError("MAX_DAILY_PROFIT_USDT must be greater than 0.")
         if self.stop_after_losses <= 0:
             raise ConfigError("STOP_AFTER_LOSSES must be greater than 0.")
+        if self.auto_analyze_every_hours < 0:
+            raise ConfigError("AUTO_ANALYZE_EVERY_HOURS must be 0 to disable or greater than 0.")
         if self.min_trades_before_learning <= 0:
             raise ConfigError("MIN_TRADES_BEFORE_LEARNING must be greater than 0.")
+        if self.backup_sl_working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
+            raise ConfigError("BACKUP_SL_WORKING_TYPE must be MARK_PRICE or CONTRACT_PRICE.")
         if not self.dry_run and self.confirm_live and not self.has_credentials:
             raise ConfigError(
                 "Non-dry-run trading requires BINANCE_API_KEY and BINANCE_API_SECRET in .env."
@@ -433,7 +453,12 @@ class BinanceFuturesBot:
         self.exit_state: Optional[PositionExitState] = None
         self.current_trade_context: Optional[TradeContext] = None
         self.learning_analysis_triggers_run: set[str] = set()
+        self.last_auto_analysis_at = time.monotonic()
+        self.pause_notified = False
         self.last_candle_fetch_warning = "Not enough candles returned; skipping cycle."
+        self.backup_sl_algo_id: Optional[str] = None
+        self.backup_tp_algo_id: Optional[str] = None
+        self.load_daily_state()
 
     def run(self) -> None:
         self.logger.info("Loaded environment file: %s", ENV_PATH)
@@ -458,10 +483,19 @@ class BinanceFuturesBot:
             self.config.allow_large_size,
         )
         self.logger.info(
-            "Learning settings: ANALYZE_ON_START=%s AUTO_APPLY_LEARNING=%s MIN_TRADES_BEFORE_LEARNING=%s",
+            "Learning settings: ANALYZE_ON_START=%s AUTO_ANALYZE_EVERY_HOURS=%s "
+            "AUTO_APPLY_LEARNING=%s MIN_TRADES_BEFORE_LEARNING=%s",
             self.config.analyze_on_start,
+            self.config.auto_analyze_every_hours,
             self.config.auto_apply_learning,
             self.config.min_trades_before_learning,
+        )
+        self.logger.info(
+            "Exchange backup protection: ENABLE_EXCHANGE_BACKUP_SL=%s ENABLE_EXCHANGE_BACKUP_TP=%s "
+            "BACKUP_SL_WORKING_TYPE=%s",
+            self.config.enable_exchange_backup_sl,
+            self.config.enable_exchange_backup_tp,
+            self.config.backup_sl_working_type,
         )
         self.warn_learning_auto_apply_if_needed()
         if self.config.analyze_on_start:
@@ -501,6 +535,8 @@ class BinanceFuturesBot:
                 self.futures_api_url("/fapi/v2/positionRisk", {"symbol": self.config.symbol}),
             )
         startup_position = self.get_position_snapshot()
+        if self.config.can_place_real_orders and startup_position.is_open:
+            self.ensure_exchange_backup_protection(startup_position)
         send_discord_message(
             self.build_status_message(
                 event="Bot started",
@@ -526,6 +562,7 @@ class BinanceFuturesBot:
                     f"Software-managed monitoring failed: {exc}"
                 )
                 raise
+            self.maybe_run_scheduled_learning_analysis()
             if self.config.run_once:
                 return
             self.logger.info(
@@ -730,14 +767,21 @@ class BinanceFuturesBot:
         if self.config.can_place_real_orders:
             if position.is_open:
                 self.ensure_software_monitoring_state(position)
+                self.ensure_exchange_backup_protection(position)
             else:
                 self.exit_state = None
                 self.cancel_all_reduce_only_orders()
+                self.cancel_all_open_algo_orders(reason="flat position cleanup")
 
         if position.is_open:
             if self.handle_exit_rules(position, mark_price):
                 self.logger.info("Exit action handled. Waiting for the next cycle.")
                 return
+
+        if self.is_paused():
+            self.handle_paused_cycle(mark_price, position)
+            return
+        self.pause_notified = False
 
         candles = self.fetch_candles()
         if candles is None:
@@ -1115,7 +1159,7 @@ class BinanceFuturesBot:
 
         self.exit_state = state
 
-        warning = "Using software-managed stops. Keep bot running. Exchange-side stop disabled."
+        warning = "Using software-managed stops as primary protection. Keep bot running."
         stop_price = self.calculate_stop_price(position, break_even=False)
         tp1_price = self.calculate_take_profit_price(position, self.config.tp1_profit_pct)
         tp2_price = self.calculate_take_profit_price(position, self.config.tp2_profit_pct)
@@ -1140,6 +1184,7 @@ class BinanceFuturesBot:
             f"stop_loss: {format_decimal(stop_price)}\n"
             f"TP1: {format_decimal(tp1_price)}\n"
             f"TP2: {format_decimal(tp2_price)}\n"
+            f"exchange_backup_sl: {'enabled' if self.config.enable_exchange_backup_sl else 'disabled'}\n"
             f"position_size: {format_decimal(abs(position.quantity))}"
         )
         return state
@@ -1158,6 +1203,7 @@ class BinanceFuturesBot:
         )
         self.logger.info(message.replace("\n", " | "))
         send_discord_message(message)
+        self.move_exchange_backup_sl_to_break_even(position)
 
     def calculate_stop_price(self, position: Position, break_even: bool) -> Decimal:
         if break_even:
@@ -1224,6 +1270,243 @@ class BinanceFuturesBot:
             )
         except (ClientError, ServerError) as exc:
             self.logger.warning("Could not cancel orderId=%s: %s", order_id, exc)
+
+    def ensure_exchange_backup_protection(self, position: Position) -> None:
+        if not self.config.can_place_real_orders or not position.is_open:
+            return
+        if self.config.enable_exchange_backup_sl:
+            self.ensure_exchange_backup_sl(position, break_even=False)
+        if self.config.enable_exchange_backup_tp:
+            self.ensure_exchange_backup_tp2(position)
+
+    def ensure_exchange_backup_sl(self, position: Position, break_even: bool) -> None:
+        if not self.config.enable_exchange_backup_sl:
+            return
+        try:
+            stop_price = self.calculate_stop_price(position, break_even=break_even)
+            expected_side = close_side_for_position(position)
+            existing = self.find_open_backup_algo_order("STOP_MARKET", expected_side)
+            if existing and algo_order_trigger_matches(existing, stop_price):
+                self.backup_sl_algo_id = get_algo_order_id(existing)
+                return
+            if existing:
+                self.cancel_algo_order(existing, reason="replace backup SL")
+            self.place_exchange_backup_sl(position, stop_price, break_even=break_even)
+        except Exception as exc:
+            self.handle_backup_algo_failure("backup SL failed", exc)
+
+    def ensure_exchange_backup_tp2(self, position: Position) -> None:
+        if not self.config.enable_exchange_backup_tp:
+            return
+        try:
+            tp2_price = self.calculate_take_profit_price(position, self.config.tp2_profit_pct)
+            expected_side = close_side_for_position(position)
+            existing = self.find_open_backup_algo_order("TAKE_PROFIT_MARKET", expected_side)
+            if existing and algo_order_trigger_matches(existing, tp2_price):
+                self.backup_tp_algo_id = get_algo_order_id(existing)
+                return
+            if existing:
+                self.cancel_algo_order(existing, reason="replace backup TP2")
+            self.place_exchange_backup_tp2(position, tp2_price)
+        except Exception as exc:
+            self.handle_backup_algo_failure("backup TP2 failed", exc)
+
+    def place_exchange_backup_sl(
+        self,
+        position: Position,
+        stop_price: Decimal,
+        break_even: bool,
+    ) -> None:
+        params = {
+            "symbol": self.config.symbol,
+            "side": close_side_for_position(position),
+            "algoType": "CONDITIONAL",
+            "type": "STOP_MARKET",
+            "triggerPrice": format_decimal(stop_price),
+            "closePosition": "true",
+            "workingType": self.config.backup_sl_working_type,
+        }
+        response = self.signed_futures_request("POST", ALGO_ORDER_PATH, params)
+        algo_id = get_algo_order_id(response)
+        self.backup_sl_algo_id = algo_id
+        self.logger.info(
+            "Backup SL algo order placed. algoId=%s side=%s triggerPrice=%s break_even=%s",
+            algo_id,
+            params["side"],
+            format_decimal(stop_price),
+            break_even,
+        )
+        send_discord_message(
+            f"{'Backup SL moved to break-even' if break_even else 'Backup SL placed'}\n"
+            f"symbol: {self.config.symbol}\n"
+            f"side: {position.side}\n"
+            f"algo_id: {algo_id or 'unknown'}\n"
+            f"trigger_price: {format_decimal(stop_price)}\n"
+            f"working_type: {self.config.backup_sl_working_type}\n"
+            f"algo_api: {ALGO_ORDER_PATH}"
+        )
+
+    def place_exchange_backup_tp2(self, position: Position, tp2_price: Decimal) -> None:
+        params = {
+            "symbol": self.config.symbol,
+            "side": close_side_for_position(position),
+            "algoType": "CONDITIONAL",
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": format_decimal(tp2_price),
+            "closePosition": "true",
+            "workingType": self.config.backup_sl_working_type,
+        }
+        response = self.signed_futures_request("POST", ALGO_ORDER_PATH, params)
+        algo_id = get_algo_order_id(response)
+        self.backup_tp_algo_id = algo_id
+        self.logger.info(
+            "Backup TP2 algo order placed. algoId=%s side=%s triggerPrice=%s",
+            algo_id,
+            params["side"],
+            format_decimal(tp2_price),
+        )
+
+    def move_exchange_backup_sl_to_break_even(self, position: Position) -> None:
+        if not self.config.can_place_real_orders or not self.config.enable_exchange_backup_sl:
+            return
+        try:
+            existing = self.find_open_backup_algo_order("STOP_MARKET", close_side_for_position(position))
+            if existing:
+                self.cancel_algo_order(existing, reason="move backup SL to break-even")
+            self.place_exchange_backup_sl(
+                position=position,
+                stop_price=self.calculate_stop_price(position, break_even=True),
+                break_even=True,
+            )
+        except Exception as exc:
+            self.handle_backup_algo_failure("backup SL failed", exc)
+
+    def find_open_backup_algo_order(self, order_type: str, side: str) -> Optional[dict[str, Any]]:
+        orders = self.get_open_algo_orders()
+        for order in orders:
+            if str(order.get("type", "")).upper() != order_type:
+                continue
+            if str(order.get("side", "")).upper() != side:
+                continue
+            if not algo_order_closes_position(order):
+                continue
+            return order
+        return None
+
+    def get_open_algo_orders(self) -> list[dict[str, Any]]:
+        response = self.signed_futures_request(
+            "GET",
+            OPEN_ALGO_ORDERS_PATH,
+            {"symbol": self.config.symbol},
+        )
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            for key in ("orders", "data", "rows"):
+                value = response.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    def cancel_algo_order(self, order: dict[str, Any], reason: str) -> None:
+        algo_id = get_algo_order_id(order)
+        if not algo_id:
+            return
+        self.signed_futures_request(
+            "DELETE",
+            ALGO_ORDER_PATH,
+            {"symbol": self.config.symbol, "algoId": algo_id},
+        )
+        self.logger.info("Backup algo order canceled. algoId=%s type=%s reason=%s", algo_id, order.get("type"), reason)
+        send_discord_message(
+            f"Backup SL canceled\n"
+            f"symbol: {self.config.symbol}\n"
+            f"algo_id: {algo_id}\n"
+            f"reason: {reason}"
+        )
+        if algo_id == self.backup_sl_algo_id:
+            self.backup_sl_algo_id = None
+        if algo_id == self.backup_tp_algo_id:
+            self.backup_tp_algo_id = None
+
+    def cancel_all_open_algo_orders(self, reason: str) -> None:
+        if not self.config.can_place_real_orders:
+            return
+        if not (self.config.enable_exchange_backup_sl or self.config.enable_exchange_backup_tp):
+            return
+        try:
+            existing_orders = self.get_open_algo_orders()
+            if not existing_orders:
+                return
+            self.signed_futures_request(
+                "DELETE",
+                ALL_OPEN_ALGO_ORDERS_PATH,
+                {"symbol": self.config.symbol},
+            )
+            self.backup_sl_algo_id = None
+            self.backup_tp_algo_id = None
+            self.logger.info("Canceled all open algo orders for %s. reason=%s", self.config.symbol, reason)
+            send_discord_message(
+                f"Backup SL canceled\n"
+                f"symbol: {self.config.symbol}\n"
+                f"reason: {reason}\n"
+                f"scope: all open algo orders"
+            )
+        except Exception as exc:
+            self.handle_backup_algo_failure("backup SL cancel failed", exc)
+
+    def signed_futures_request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any],
+    ) -> Any:
+        if not self.config.has_credentials:
+            raise ConfigError("API credentials are required for signed Algo Order API requests.")
+        query_params = {
+            **params,
+            "timestamp": int(time.time() * 1000),
+            "recvWindow": 5000,
+        }
+        query_string = urlencode(query_params)
+        signature = hmac.new(
+            (self.config.api_secret or "").encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        signed_params = {**query_params, "signature": signature}
+        url = f"{self.futures_base_url}{path}"
+        self.validate_futures_url(url)
+        self.logger.info("Binance signed REST request: %s %s", method.upper(), url)
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            params=signed_params,
+            headers={"X-MBX-APIKEY": self.config.api_key or ""},
+            timeout=self.config.request_timeout,
+        )
+        payload: Any
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = response.text
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Algo Order API failed status={response.status_code} response={payload}"
+            )
+        if isinstance(payload, dict) and "code" in payload and int(payload.get("code", 0)) < 0:
+            raise RuntimeError(f"Algo Order API failed response={payload}")
+        return payload
+
+    def handle_backup_algo_failure(self, title: str, exc: Exception) -> None:
+        message = (
+            f"{title}\n"
+            f"symbol: {self.config.symbol}\n"
+            f"error: {format_exception_for_log(exc) if isinstance(exc, Exception) else exc}\n"
+            f"fallback: software-managed SL/TP remains active"
+        )
+        self.logger.error(message.replace("\n", " | "))
+        send_discord_message(message)
 
     def initial_stop_reason(self, position: Position, mark_price: Decimal) -> Optional[str]:
         stop_loss_ratio = self.config.stop_loss_pct / Decimal("100")
@@ -1529,15 +1812,15 @@ class BinanceFuturesBot:
             self.config.symbol,
         )
         self.logger.info(
-            "Dry-run protective orders: STOP_MARKET reduceOnly stop=%s quantity=%s; "
-            "TP1 TAKE_PROFIT_MARKET reduceOnly stop=%s quantity=%s; "
-            "TP2 TAKE_PROFIT_MARKET reduceOnly stop=%s quantity=%s.",
+            "Dry-run protection: software SL=%s; software TP1=%s quantity=%s; software TP2=%s quantity=%s; "
+            "exchange backup SL algo=%s; exchange backup TP2 algo=%s.",
             format_decimal(self.calculate_stop_price(planned_position, break_even=False)),
-            format_decimal(quantity),
             format_decimal(self.calculate_take_profit_price(planned_position, self.config.tp1_profit_pct)),
             format_decimal(tp1_quantity),
             format_decimal(self.calculate_take_profit_price(planned_position, self.config.tp2_profit_pct)),
             format_decimal(tp2_quantity),
+            self.config.enable_exchange_backup_sl,
+            self.config.enable_exchange_backup_tp,
         )
 
     def log_entry_risk_before_order(
@@ -1801,6 +2084,7 @@ class BinanceFuturesBot:
         )
         if final_exit:
             self.cancel_all_reduce_only_orders()
+            self.cancel_all_open_algo_orders(reason="position closed")
             self.exit_state = None
         exit_message = (
             f"{'Exit' if final_exit else 'Partial exit'} executed\n"
@@ -1839,12 +2123,15 @@ class BinanceFuturesBot:
         )
         self.log_entry_risk_before_order(action, quantity, mark_price, sizing_plan)
         self.submit_market_order(side=side, quantity=quantity, reduce_only=False)
+        self.trades_today += 1
+        self.save_daily_state()
 
         try:
             live_position = self.wait_for_live_position(action)
             self.last_known_position = live_position
             self.current_trade_context = self.build_trade_context_from_signal(signal, live_position)
             self.install_software_managed_exit_state(live_position)
+            self.ensure_exchange_backup_protection(live_position)
         except Exception as exc:
             self.logger.exception("Software protection setup failed after entry. Closing position defensively.")
             send_discord_message(
@@ -1862,7 +2149,6 @@ class BinanceFuturesBot:
             )
             raise
 
-        self.trades_today += 1
         entry_message = (
             f"Entry executed\n"
             f"symbol: {self.config.symbol}\n"
@@ -1967,6 +2253,27 @@ class BinanceFuturesBot:
         )
         send_discord_message(message)
 
+    def is_paused(self) -> bool:
+        return PAUSED_LOCK_PATH.exists()
+
+    def handle_paused_cycle(self, mark_price: Decimal, position: Position) -> None:
+        self.last_signal = "PAUSED | PAUSED.lock exists; new entries disabled"
+        self.logger.warning(
+            "PAUSED.lock exists. New entries are disabled, but existing position management remains active."
+        )
+        if not self.pause_notified:
+            send_discord_message(
+                self.build_status_message(
+                    event="Trading paused",
+                    status="PAUSED",
+                    mark_price=mark_price,
+                    position=position,
+                )
+                + "\nreason: PAUSED.lock exists"
+            )
+            self.pause_notified = True
+        self.maybe_send_heartbeat(mark_price, position)
+
     def maybe_send_heartbeat(self, mark_price: Decimal, position: Position) -> None:
         heartbeat_seconds = self.config.heartbeat_interval_minutes * 60
         elapsed = time.monotonic() - self.last_heartbeat_at
@@ -1999,6 +2306,7 @@ class BinanceFuturesBot:
             f"trades_today: {self.trades_today}",
             f"losses_today: {self.losses_today}",
             f"last signal: {self.last_signal}",
+            f"paused: {'yes' if self.is_paused() else 'no'}",
             f"dry-run/live status: {self.config.mode_label}",
         ]
         limit_reason = self.peek_trade_block_reason()
@@ -2007,6 +2315,8 @@ class BinanceFuturesBot:
         return "\n".join(lines)
 
     def current_status(self) -> str:
+        if self.is_paused():
+            return "PAUSED"
         return "TRADE_LIMIT_HIT" if self.peek_trade_block_reason() else "RUNNING"
 
     def log_order_block(self, action: str) -> None:
@@ -2025,20 +2335,85 @@ class BinanceFuturesBot:
         raise ConfigError(f"Real order action blocked: {reason}.")
 
     def reset_daily_counters_if_needed(self) -> None:
-        today = utc_today()
-        if today == self.current_day:
-            return
         previous_day = self.current_day
+        if not self.sync_daily_state_from_file():
+            return
         self.run_learning_analysis(f"utc_day_rollover:{previous_day}")
-        self.current_day = today
-        self.trades_today = 0
-        self.losses_today = 0
         self.daily_loss_usdt = Decimal("0")
         self.daily_profit_usdt = Decimal("0")
         self.trade_shutdown_reason = None
         self.trade_shutdown_notified = False
         self.last_signal_alert_key = None
-        self.logger.info("New UTC day detected. Daily counters have been reset.")
+        self.logger.info("New day detected: counters reset")
+
+    def load_daily_state(self) -> None:
+        today = utc_today()
+        state = self.read_daily_state()
+        if not state:
+            self.current_day = today
+            self.trades_today = 0
+            self.losses_today = 0
+            self.save_daily_state()
+            self.logger.info("Loaded daily state: trades=%s losses=%s", self.trades_today, self.losses_today)
+            return
+
+        stored_date = normalize_daily_state_date(state.get("date"))
+        today_text = format_daily_state_date(today)
+        if stored_date != today_text:
+            self.current_day = today
+            self.trades_today = 0
+            self.losses_today = 0
+            self.save_daily_state()
+            self.logger.info("New day detected: counters reset")
+            self.logger.info("Loaded daily state: trades=%s losses=%s", self.trades_today, self.losses_today)
+            return
+
+        self.current_day = today
+        self.trades_today = safe_int(state.get("trades_today"), 0)
+        self.losses_today = safe_int(state.get("losses_today"), 0)
+        self.save_daily_state()
+        self.logger.info("Loaded daily state: trades=%s losses=%s", self.trades_today, self.losses_today)
+
+    def sync_daily_state_from_file(self) -> bool:
+        today = utc_today()
+        state = self.read_daily_state()
+        today_text = format_daily_state_date(today)
+        stored_date = normalize_daily_state_date(state.get("date") if state else None)
+
+        if stored_date != today_text:
+            self.current_day = today
+            self.trades_today = 0
+            self.losses_today = 0
+            self.save_daily_state()
+            return True
+
+        file_trades = safe_int(state.get("trades_today"), 0) if state else 0
+        file_losses = safe_int(state.get("losses_today"), 0) if state else 0
+        if file_trades != self.trades_today or file_losses != self.losses_today:
+            self.trades_today = file_trades
+            self.losses_today = file_losses
+            self.logger.info("Loaded daily state: trades=%s losses=%s", self.trades_today, self.losses_today)
+        self.current_day = today
+        return False
+
+    def read_daily_state(self) -> dict[str, Any]:
+        if not DAILY_STATE_PATH.exists():
+            return {}
+        try:
+            payload = json.loads(DAILY_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.warning("Could not read daily_state.json; recreating it. error=%s", exc)
+        return {}
+
+    def save_daily_state(self) -> None:
+        payload = {
+            "date": format_daily_state_date(self.current_day),
+            "trades_today": int(self.trades_today),
+            "losses_today": int(self.losses_today),
+        }
+        DAILY_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def peek_trade_block_reason(self) -> Optional[str]:
         if self.config.max_trades_per_day > 0 and self.trades_today >= self.config.max_trades_per_day:
@@ -2095,6 +2470,7 @@ class BinanceFuturesBot:
         else:
             self.daily_loss_usdt += abs(realized_pnl)
             self.losses_today += 1
+            self.save_daily_state()
         self.logger.info(
             "Daily performance updated. profit=%s loss=%s losses_today=%s",
             format_decimal(self.daily_profit_usdt),
@@ -2151,6 +2527,19 @@ class BinanceFuturesBot:
 
         self.logger.info("Learning analyzer completed. Discord completion alert is handled by trade_analyzer.py.")
 
+    def maybe_run_scheduled_learning_analysis(self) -> None:
+        if self.config.auto_analyze_every_hours <= 0:
+            return
+
+        interval_seconds = self.config.auto_analyze_every_hours * 60 * 60
+        elapsed = time.monotonic() - self.last_auto_analysis_at
+        if elapsed < interval_seconds:
+            return
+
+        self.last_auto_analysis_at = time.monotonic()
+        trigger_time = datetime.now(timezone.utc).isoformat(timespec="hours")
+        self.run_learning_analysis(f"scheduled:{trigger_time}")
+
     def build_learning_discord_summary(self, trigger: str) -> str:
         if not LEARNING_STATE_PATH.exists():
             return (
@@ -2204,6 +2593,39 @@ def get_order_id(order: dict[str, Any]) -> Optional[int]:
         return int(raw_order_id)
     except (TypeError, ValueError):
         return None
+
+
+def get_algo_order_id(order: dict[str, Any]) -> Optional[str]:
+    for key in ("algoId", "orderId", "clientAlgoId", "clientOrderId"):
+        raw_value = order.get(key)
+        if raw_value is not None and str(raw_value).strip():
+            return str(raw_value).strip()
+    return None
+
+
+def close_side_for_position(position: Position) -> str:
+    if position.side == "LONG":
+        return "SELL"
+    if position.side == "SHORT":
+        return "BUY"
+    raise ConfigError("Cannot calculate close side for a flat position.")
+
+
+def algo_order_closes_position(order: dict[str, Any]) -> bool:
+    value = order.get("closePosition")
+    return value is True or str(value).strip().lower() == "true"
+
+
+def algo_order_trigger_matches(order: dict[str, Any], expected_price: Decimal) -> bool:
+    for key in ("triggerPrice", "stopPrice", "activatePrice"):
+        raw_value = order.get(key)
+        if raw_value is None:
+            continue
+        try:
+            return Decimal(str(raw_value)) == expected_price
+        except InvalidOperation:
+            return False
+    return False
 
 
 def is_reduce_only_order(order: dict[str, Any]) -> bool:
@@ -2549,6 +2971,113 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def format_daily_state_date(day: date) -> str:
+    return day.strftime("%d-%m-%Y")
+
+
+def normalize_daily_state_date(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for date_format in ("%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return format_daily_state_date(datetime.strptime(text, date_format).date())
+        except ValueError:
+            continue
+    return None
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_bot_lock_pid() -> Optional[int]:
+    if not BOT_LOCK_PATH.exists():
+        return None
+    try:
+        content = BOT_LOCK_PATH.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        try:
+            payload = json.loads(content)
+            return int(payload.get("pid"))
+        except json.JSONDecodeError:
+            return int(content)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_bot_lock() -> bool:
+    logger = logging.getLogger("main")
+    existing_pid = read_bot_lock_pid()
+    if existing_pid and existing_pid != os.getpid() and process_is_running(existing_pid):
+        message = (
+            "Main bot already running\n"
+            f"lock_file: {BOT_LOCK_PATH}\n"
+            f"pid: {existing_pid}\n"
+            "action: refusing to start a second main.py instance"
+        )
+        logger.warning(message.replace("\n", " | "))
+        send_discord_message(message)
+        return False
+
+    if BOT_LOCK_PATH.exists():
+        logger.warning("Removing stale bot.lock before startup: %s", BOT_LOCK_PATH)
+        try:
+            BOT_LOCK_PATH.unlink()
+        except OSError as exc:
+            logger.error("Could not remove stale bot.lock: %s", exc)
+            send_discord_message(f"Bot startup blocked\nreason: could not remove stale bot.lock\nerror: {exc}")
+            return False
+
+    payload = {
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "script": str(Path(__file__).resolve()),
+    }
+    try:
+        BOT_LOCK_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Could not create bot.lock: %s", exc)
+        send_discord_message(f"Bot startup blocked\nreason: could not create bot.lock\nerror: {exc}")
+        return False
+
+    logger.info("Created single-instance lock: %s", BOT_LOCK_PATH)
+    return True
+
+
+def release_bot_lock() -> None:
+    existing_pid = read_bot_lock_pid()
+    if existing_pid is not None and existing_pid != os.getpid():
+        logging.getLogger("main").warning(
+            "Not removing bot.lock because it belongs to pid=%s.", existing_pid
+        )
+        return
+    try:
+        if BOT_LOCK_PATH.exists():
+            BOT_LOCK_PATH.unlink()
+            logging.getLogger("main").info("Removed single-instance lock: %s", BOT_LOCK_PATH)
+    except OSError as exc:
+        logging.getLogger("main").warning("Could not remove bot.lock: %s", exc)
+
+
 def handle_shutdown(signum, frame) -> None:
     logging.getLogger("main").warning("Shutdown signal received: %s", signum)
     send_discord_message("⚠️ BOT STOPPED (manual or system shutdown)")
@@ -2562,6 +3091,7 @@ def register_shutdown_handlers() -> None:
 
 def main() -> int:
     crash_alert_sent = False
+    lock_acquired = False
     try:
         config = BotConfig.from_env()
         configure_logging(config.log_level)
@@ -2571,6 +3101,10 @@ def main() -> int:
                 "API credentials are missing or placeholders are still present. "
                 "The bot will only run safely in dry-run mode."
             )
+
+        lock_acquired = acquire_bot_lock()
+        if not lock_acquired:
+            return 1
 
         bot = BinanceFuturesBot(config)
         send_discord_message("✅ BOT STARTED (VPS LIVE)")
@@ -2587,6 +3121,9 @@ def main() -> int:
             logging.getLogger("main").exception("Bot crashed: %s", exc)
             send_discord_message(f"❌ BOT CRASHED: {str(exc)}")
         raise
+    finally:
+        if lock_acquired:
+            release_bot_lock()
 
 
 if __name__ == "__main__":

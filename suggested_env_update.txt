@@ -1,0 +1,6 @@
+# Suggested .env update for MoneyMaker
+# Generated after trade_analyzer.py runs.
+# Safety: review manually before applying. This file is never auto-applied.
+# Learning may only recommend stricter filters. It must not increase leverage or order size.
+
+# No .env filter update is recommended yet.

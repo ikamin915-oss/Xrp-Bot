@@ -24,6 +24,8 @@ ENV_PATH = PROJECT_DIR / ".env"
 TRADES_CSV_PATH = PROJECT_DIR / "trades.csv"
 REPORT_PATH = PROJECT_DIR / "learning_report.md"
 STATE_PATH = PROJECT_DIR / "learning_state.json"
+SUGGESTED_ENV_UPDATE_PATH = PROJECT_DIR / "suggested_env_update.txt"
+SUGGESTED_STRATEGY_UPDATE_PATH = PROJECT_DIR / "suggested_strategy_update.md"
 BOT_LOG_PATHS = [
     PROJECT_DIR / "bot.log",
     PROJECT_DIR / "main.log",
@@ -607,6 +609,126 @@ def empty_outputs(min_trades: int, auto_apply_learning: bool) -> tuple[str, dict
     return report, state
 
 
+def write_suggested_upgrade_files(state: dict[str, Any]) -> None:
+    recommendations = state.get("recommended_parameter_changes", [])
+    patterns = state.get("detected_losing_patterns", [])
+    generated_at = state.get("generated_at", datetime.now(timezone.utc).isoformat())
+
+    env_lines = [
+        "# Suggested .env update for MoneyMaker",
+        f"# Generated at: {generated_at}",
+        "# Safety: review manually before applying. This file is never auto-applied.",
+        "# Learning may only recommend stricter filters. It must not increase leverage or order size.",
+        "",
+    ]
+    if recommendations:
+        for item in recommendations:
+            env_lines.extend(format_env_recommendation(item))
+    else:
+        env_lines.append("# No .env filter update is recommended yet.")
+    SUGGESTED_ENV_UPDATE_PATH.write_text("\n".join(env_lines).rstrip() + "\n", encoding="utf-8")
+
+    strategy_lines = [
+        "# Suggested Strategy Update",
+        "",
+        f"Generated at: `{generated_at}`",
+        "",
+        "Safety: these are patch notes only. No `.env` or `main.py` changes were applied.",
+        "",
+        "## Top Losing Patterns",
+        "",
+    ]
+    if patterns:
+        for pattern in patterns[:5]:
+            strategy_lines.append(
+                f"- {pattern.get('pattern', 'pattern')}: {pattern.get('loss_count', 0)} loss(es), "
+                f"{pattern.get('loss_share_pct', 0)}% of losses. {pattern.get('suggestion', 'Review manually.')}"
+            )
+    else:
+        strategy_lines.append("- No repeated losing pattern is clear yet.")
+
+    strategy_lines.extend(["", "## Suggested Stricter Filters", ""])
+    if recommendations:
+        for item in recommendations:
+            parameter = item.get("parameter", "filter")
+            direction = item.get("direction", "review")
+            reason = item.get("reason", "Review this filter manually.")
+            value = item.get("suggested_min", item.get("suggested_max", "manual review"))
+            strategy_lines.append(f"- `{parameter}` `{direction}` -> `{value}` because {reason}.")
+    else:
+        strategy_lines.append("- No filter change suggested yet.")
+
+    strategy_lines.extend(
+        [
+            "",
+            "## Approval Requirement",
+            "",
+            "- Human approval is required before applying any suggested `.env` setting.",
+            "- Do not increase leverage or order size from learning output.",
+            "- Do not loosen filters automatically.",
+        ]
+    )
+    SUGGESTED_STRATEGY_UPDATE_PATH.write_text("\n".join(strategy_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def format_env_recommendation(item: dict[str, Any]) -> list[str]:
+    parameter = str(item.get("parameter", "")).strip().upper()
+    direction = item.get("direction", "review")
+    reason = item.get("reason", "Review manually.")
+    if not parameter or "LEVERAGE" in parameter or "ORDER_SIZE" in parameter:
+        return []
+
+    lines = [
+        f"# {reason}",
+        f"# Direction: {direction}",
+    ]
+    if "suggested_min" in item:
+        lines.append(f"{parameter}={item['suggested_min']}")
+    elif "suggested_max" in item:
+        lines.append(f"{parameter}={item['suggested_max']}")
+    else:
+        lines.append(f"# {parameter}=manual_review_required")
+    lines.append("")
+    return lines
+
+
+def total_pnl_from_metrics(metrics: dict[str, Any]) -> float:
+    gross_profit = safe_float(metrics.get("gross_profit", 0))
+    gross_loss = safe_float(metrics.get("gross_loss", 0))
+    return round_value(gross_profit - gross_loss)
+
+
+def summarize_patterns_for_discord(state: dict[str, Any]) -> str:
+    patterns = state.get("detected_losing_patterns", [])
+    if not patterns:
+        return "none detected"
+    return "; ".join(
+        f"{item.get('pattern', 'pattern')} ({item.get('loss_count', 0)} losses)"
+        for item in patterns[:3]
+    )
+
+
+def summarize_recommendations_for_discord(state: dict[str, Any]) -> str:
+    recommendations = state.get("recommended_parameter_changes", [])
+    if not recommendations:
+        return "none"
+    parts = []
+    for item in recommendations[:3]:
+        parameter = item.get("parameter", "filter")
+        value = item.get("suggested_min", item.get("suggested_max", "manual review"))
+        parts.append(f"{parameter} -> {value}")
+    return "; ".join(parts)
+
+
+def safe_float(value: Any) -> float:
+    try:
+        if value == "inf":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def send_discord_embed(
     title: str,
     fields: list[dict[str, Any]] | None = None,
@@ -662,6 +784,7 @@ def send_analysis_completed_alert(state: dict[str, Any]) -> None:
     metrics = state.get("metrics", {})
     recommendations = state.get("recommended_parameter_changes", [])
     insights = top_learning_insights(state)
+    total_pnl = total_pnl_from_metrics(metrics)
     description = "No top insights detected yet."
     if insights:
         description = "\n".join(f"{index}. {insight}" for index, insight in enumerate(insights, start=1))
@@ -672,13 +795,26 @@ def send_analysis_completed_alert(state: dict[str, Any]) -> None:
             discord_field("Total Trades", metrics.get("total_trades", 0), inline=True),
             discord_field("Win Rate", f"{metrics.get('win_rate_pct', 0)}%", inline=True),
             discord_field("Profit Factor", metrics.get("profit_factor", 0), inline=True),
+            discord_field("Total PnL", total_pnl, inline=True),
             discord_field("Suggestions Exist", "yes" if recommendations else "no", inline=True),
-            discord_field("Suggested Only", str(state.get("suggested_only", True)).lower(), inline=True),
-            discord_field("Enough Trades", str(state.get("enough_trades_for_learning", False)).lower(), inline=True),
+            discord_field("Env Update Recommended", "yes" if recommendations else "no", inline=True),
+            discord_field("Top Losing Patterns", summarize_patterns_for_discord(state), inline=False),
+            discord_field("Suggested Stricter Filters", summarize_recommendations_for_discord(state), inline=False),
         ],
         description=description,
         color=DISCORD_LEARNING_COLOR if recommendations else DISCORD_WARNING_COLOR,
     )
+    if recommendations:
+        send_discord_embed(
+            title="Env update suggested. Review suggested_env_update.txt",
+            fields=[
+                discord_field("Suggested Env File", "suggested_env_update.txt", inline=True),
+                discord_field("Strategy Notes", "suggested_strategy_update.md", inline=True),
+                discord_field("Auto Applied", "false", inline=True),
+            ],
+            description="Human approval is required before applying any learning suggestion.",
+            color=DISCORD_WARNING_COLOR,
+        )
 
 
 def top_learning_insights(state: dict[str, Any]) -> list[str]:
@@ -760,10 +896,13 @@ def main() -> int:
 
     REPORT_PATH.write_text(report, encoding="utf-8")
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    write_suggested_upgrade_files(state)
     if analysis_discord_alert:
         send_analysis_completed_alert(state)
     print(f"Learning report written to {REPORT_PATH}")
     print(f"Learning state written to {STATE_PATH}")
+    print(f"Suggested env update written to {SUGGESTED_ENV_UPDATE_PATH}")
+    print(f"Suggested strategy update written to {SUGGESTED_STRATEGY_UPDATE_PATH}")
     return 0
 
 
