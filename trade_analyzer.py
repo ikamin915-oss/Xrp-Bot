@@ -26,6 +26,7 @@ REPORT_PATH = PROJECT_DIR / "learning_report.md"
 STATE_PATH = PROJECT_DIR / "learning_state.json"
 SUGGESTED_ENV_UPDATE_PATH = PROJECT_DIR / "suggested_env_update.txt"
 SUGGESTED_STRATEGY_UPDATE_PATH = PROJECT_DIR / "suggested_strategy_update.md"
+SUGGESTED_STRATEGY_PATCH_PATH = PROJECT_DIR / "suggested_strategy_update.patch"
 BOT_LOG_PATHS = [
     PROJECT_DIR / "bot.log",
     PROJECT_DIR / "main.log",
@@ -633,7 +634,7 @@ def write_suggested_upgrade_files(state: dict[str, Any]) -> None:
         "",
         f"Generated at: `{generated_at}`",
         "",
-        "Safety: these are patch notes only. No `.env` or `main.py` changes were applied.",
+        "Safety: these are strategy notes. Automatic application depends on the Discord bot upgrade settings.",
         "",
         "## Top Losing Patterns",
         "",
@@ -661,14 +662,15 @@ def write_suggested_upgrade_files(state: dict[str, Any]) -> None:
     strategy_lines.extend(
         [
             "",
-            "## Approval Requirement",
+            "## Upgrade Mode",
             "",
-            "- Human approval is required before applying any suggested `.env` setting.",
+            "- Automatic application depends on the Discord bot auto-upgrade configuration.",
             "- Do not increase leverage or order size from learning output.",
             "- Do not loosen filters automatically.",
         ]
     )
     SUGGESTED_STRATEGY_UPDATE_PATH.write_text("\n".join(strategy_lines).rstrip() + "\n", encoding="utf-8")
+    SUGGESTED_STRATEGY_PATCH_PATH.write_text("", encoding="utf-8")
 
 
 def format_env_recommendation(item: dict[str, Any]) -> list[str]:
@@ -923,6 +925,7 @@ def main() -> int:
     print(f"Learning state written to {STATE_PATH}")
     print(f"Suggested env update written to {SUGGESTED_ENV_UPDATE_PATH}")
     print(f"Suggested strategy update written to {SUGGESTED_STRATEGY_UPDATE_PATH}")
+    print(f"Suggested strategy patch written to {SUGGESTED_STRATEGY_PATCH_PATH}")
     return 0
 
 

@@ -46,6 +46,8 @@ LEARNING_REPORT_PATH = PROJECT_DIR / "learning_report.md"
 LEARNING_STATE_PATH = PROJECT_DIR / "learning_state.json"
 SUGGESTED_ENV_UPDATE_PATH = PROJECT_DIR / "suggested_env_update.txt"
 SUGGESTED_STRATEGY_UPDATE_PATH = PROJECT_DIR / "suggested_strategy_update.md"
+SUGGESTED_STRATEGY_PATCH_PATH = PROJECT_DIR / "suggested_strategy_update.patch"
+AUTO_UPGRADE_PATCH_PATH = PROJECT_DIR / ".auto_upgrade_work.patch"
 PAUSED_LOCK_PATH = PROJECT_DIR / "PAUSED.lock"
 BOT_LOCK_PATH = PROJECT_DIR / "bot.lock"
 ADMIN_ACTION_LOG_PATH = PROJECT_DIR / "admin_actions.log"
@@ -91,6 +93,10 @@ SAFE_ENV_UPGRADE_KEYS = {
     "TREND_MOMENTUM_LOOKBACK",
     "MIN_TREND_MOMENTUM_PCT",
 }
+SAFE_CODE_UPGRADE_TARGETS = {
+    "main.py",
+    "trade_analyzer.py",
+}
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,7 @@ class DiscordBotConfig:
     auto_upgrade_interval_hours: int
     upgrade_confirm_password: Optional[str]
     auto_code_upgrade_enabled: bool
+    auto_upgrade_require_approval: bool
 
     @property
     def has_credentials(self) -> bool:
@@ -164,6 +171,7 @@ def load_config() -> DiscordBotConfig:
         auto_upgrade_interval_hours=parse_positive_int(os.getenv("AUTO_UPGRADE_INTERVAL_HOURS"), 12),
         upgrade_confirm_password=normalize_optional_value(os.getenv("UPGRADE_CONFIRM_PASSWORD")),
         auto_code_upgrade_enabled=parse_bool(os.getenv("AUTO_CODE_UPGRADE_ENABLED"), False),
+        auto_upgrade_require_approval=parse_bool(os.getenv("AUTO_UPGRADE_REQUIRE_APPROVAL"), True),
     )
 
 
@@ -563,6 +571,9 @@ def new_upgrade_state() -> dict[str, Any]:
         "created_at": None,
         "expires_at": 0.0,
         "safe_updates": {},
+        "safe_code_patch": "",
+        "code_patch_targets": [],
+        "blocked_code_patch_reason": None,
         "blocked_updates": {},
         "risk_level": "none",
         "learning_state": {},
@@ -582,8 +593,9 @@ async def auto_upgrade_loop(
     interval_seconds = config.auto_upgrade_interval_hours * 60 * 60
     next_run_at = time.monotonic() + interval_seconds
     logging.getLogger("discord_bot").info(
-        "Auto-upgrade scheduler enabled. interval_hours=%s",
+        "Auto-upgrade scheduler enabled. interval_hours=%s require_approval=%s",
         config.auto_upgrade_interval_hours,
+        config.auto_upgrade_require_approval,
     )
 
     while not bot.is_closed():
@@ -592,7 +604,7 @@ async def auto_upgrade_loop(
             await apply_waiting_upgrade_if_flat(bot, config, upgrade_state)
             if (
                 time.monotonic() >= next_run_at
-                and upgrade_state.get("status") not in {"pending", "approved_waiting_flat", "applying"}
+                and upgrade_state.get("status") not in {"pending", "approved_waiting_flat", "auto_waiting_flat", "applying"}
             ):
                 await run_auto_upgrade_analysis(bot, config, upgrade_state)
                 next_run_at = time.monotonic() + interval_seconds
@@ -611,7 +623,10 @@ async def run_auto_upgrade_analysis(
     config: DiscordBotConfig,
     upgrade_state: dict[str, Any],
 ) -> None:
-    logging.getLogger("discord_bot").info("Running scheduled approval-gated auto-upgrade analysis.")
+    logging.getLogger("discord_bot").info(
+        "Running scheduled auto-upgrade analysis. require_approval=%s",
+        config.auto_upgrade_require_approval,
+    )
     result = await run_analyzer_subprocess(discord_alert=False)
     if result["returncode"] != 0:
         await dm_admins(
@@ -627,15 +642,19 @@ async def run_auto_upgrade_analysis(
 
     state = load_learning_state()
     safe_updates, blocked_updates = load_safe_suggested_env_updates()
-    if not safe_updates:
+    safe_code_patch, code_patch_targets, blocked_code_reason = load_safe_code_patch(config)
+    if not safe_updates and not safe_code_patch:
         upgrade_state.clear()
         upgrade_state.update(new_upgrade_state())
+        description = "No safe `.env` or code upgrade is currently recommended. No changes were applied."
+        if blocked_code_reason:
+            description += f"\n\nCode patch skipped: {blocked_code_reason}"
         await dm_admins(
             bot,
             config,
             make_embed(
                 "Learning analysis completed",
-                "No safe `.env` upgrade is currently recommended. No changes were applied.",
+                description,
                 discord.Color.orange(),
             ),
         )
@@ -645,17 +664,43 @@ async def run_auto_upgrade_analysis(
     upgrade_state.clear()
     upgrade_state.update(
         {
-            "status": "pending",
+            "status": "pending" if config.auto_upgrade_require_approval else "auto_waiting_flat",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "expires_at": expires_at,
             "safe_updates": safe_updates,
+            "safe_code_patch": safe_code_patch,
+            "code_patch_targets": code_patch_targets,
+            "blocked_code_patch_reason": blocked_code_reason,
             "blocked_updates": blocked_updates,
-            "risk_level": risk_level_for_updates(safe_updates),
+            "risk_level": risk_level_for_updates(safe_updates, code_patch_targets),
             "learning_state": state,
             "last_notice_at": time.monotonic(),
         }
     )
-    await dm_admins(bot, config, build_upgrade_ready_embed(config, upgrade_state))
+    if config.auto_upgrade_require_approval:
+        await dm_admins(bot, config, build_upgrade_ready_embed(config, upgrade_state))
+        return
+
+    create_pause_lock("Automatic upgrade pending")
+    try:
+        snapshot = await asyncio.to_thread(fetch_position_snapshot, config)
+    except Exception as exc:
+        upgrade_state.update({"status": "error", "error": format_binance_error(exc)})
+        await dm_admins(
+            bot,
+            config,
+            make_embed(
+                "Auto-upgrade blocked",
+                f"Could not confirm position status: {format_binance_error(exc)}",
+                discord.Color.red(),
+            ),
+        )
+        return
+
+    await dm_admins(bot, config, build_auto_upgrade_ready_embed(config, upgrade_state, snapshot))
+    if snapshot.is_open:
+        return
+    await apply_approved_upgrade(bot, config, upgrade_state, approved_by="auto-no-approval")
 
 
 async def expire_pending_upgrade_if_needed(
@@ -687,7 +732,7 @@ async def apply_waiting_upgrade_if_flat(
     config: DiscordBotConfig,
     upgrade_state: dict[str, Any],
 ) -> None:
-    if upgrade_state.get("status") != "approved_waiting_flat":
+    if upgrade_state.get("status") not in {"approved_waiting_flat", "auto_waiting_flat"}:
         return
 
     try:
@@ -714,13 +759,22 @@ async def apply_waiting_upgrade_if_flat(
                 config,
                 make_embed(
                     "Upgrade waiting for flat position",
-                    f"Open {snapshot.side} position remains. New entries are paused; no changes applied yet.",
+                    (
+                        f"Open {snapshot.side} position remains. New entries are paused; no changes applied yet."
+                        if upgrade_state.get("status") == "approved_waiting_flat"
+                        else f"Open {snapshot.side} position remains. Auto-upgrade is queued and will apply once flat."
+                    ),
                     discord.Color.orange(),
                 ),
             )
         return
 
-    await apply_approved_upgrade(bot, config, upgrade_state, approved_by="auto-flat-check")
+    approved_by = (
+        "auto-flat-check"
+        if upgrade_state.get("status") == "approved_waiting_flat"
+        else "auto-no-approval-flat-check"
+    )
+    await apply_approved_upgrade(bot, config, upgrade_state, approved_by=approved_by)
 
 
 async def approve_pending_upgrade(
@@ -797,6 +851,8 @@ async def apply_approved_upgrade(
     )
     embed = make_embed("Upgrade applied", color=discord.Color.green())
     embed.add_field(name="Applied .env changes", value=truncate(format_dict_lines(result["applied_updates"]), MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Code result", value=truncate(result.get("code_result", "n/a"), MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Compile check", value=truncate(result.get("compile_result", "n/a"), MAX_FIELD_LENGTH), inline=False)
     embed.add_field(name="Backup", value=f"`{result['backup_dir']}`", inline=False)
     embed.add_field(name="Git", value=truncate(result["git_result"], MAX_FIELD_LENGTH), inline=False)
     embed.add_field(name="Restart", value=truncate(result["restart_result"], MAX_FIELD_LENGTH), inline=False)
@@ -806,26 +862,42 @@ async def apply_approved_upgrade(
 
 def apply_upgrade_sync(config: DiscordBotConfig, upgrade_state: dict[str, Any]) -> dict[str, Any]:
     safe_updates = dict(upgrade_state.get("safe_updates") or {})
-    if not safe_updates:
-        raise RuntimeError("No safe .env updates are available to apply.")
+    safe_code_patch = str(upgrade_state.get("safe_code_patch") or "")
+    code_patch_targets = [str(item) for item in (upgrade_state.get("code_patch_targets") or []) if str(item).strip()]
+    if not safe_updates and not safe_code_patch:
+        raise RuntimeError("No safe .env or code updates are available to apply.")
 
     create_pause_lock("Applying approved auto-upgrade")
     backup_dir = create_backup()
-    applied_updates = apply_env_updates(safe_updates)
-    git_result = commit_upgrade_changes()
-    stopped = stop_trading_processes(include_analyzer=False)
-    time.sleep(2)
-    restart_result = start_main_bot_process()
-    if PAUSED_LOCK_PATH.exists():
-        PAUSED_LOCK_PATH.unlink()
-    return {
-        "backup_dir": str(backup_dir),
-        "applied_updates": applied_updates,
-        "stopped_pids": stopped,
-        "git_result": git_result,
-        "restart_result": restart_result,
-        "auto_code_upgrade_enabled": config.auto_code_upgrade_enabled,
-    }
+    applied_updates: dict[str, str] = {}
+    code_result = "no code patch applied"
+    compile_result = "no python code changes"
+    try:
+        if safe_updates:
+            applied_updates = apply_env_updates(safe_updates)
+        if safe_code_patch and code_patch_targets:
+            code_result = apply_code_patch(safe_code_patch, code_patch_targets)
+            compile_result = compile_python_targets(code_patch_targets)
+        git_result = commit_upgrade_changes()
+        stopped = stop_trading_processes(include_analyzer=False)
+        time.sleep(2)
+        restart_result = start_main_bot_process()
+        return {
+            "backup_dir": str(backup_dir),
+            "applied_updates": applied_updates,
+            "code_result": code_result,
+            "compile_result": compile_result,
+            "stopped_pids": stopped,
+            "git_result": git_result,
+            "restart_result": restart_result,
+            "auto_code_upgrade_enabled": config.auto_code_upgrade_enabled,
+        }
+    except Exception:
+        restore_backup(backup_dir)
+        raise
+    finally:
+        if PAUSED_LOCK_PATH.exists():
+            PAUSED_LOCK_PATH.unlink()
 
 
 def create_pause_lock(reason: str) -> None:
@@ -850,6 +922,7 @@ def create_backup() -> Path:
         LEARNING_STATE_PATH,
         SUGGESTED_ENV_UPDATE_PATH,
         SUGGESTED_STRATEGY_UPDATE_PATH,
+        SUGGESTED_STRATEGY_PATCH_PATH,
     ]:
         if path.exists():
             shutil.copy2(path, backup_dir / path.name)
@@ -877,6 +950,66 @@ def load_safe_suggested_env_updates() -> tuple[dict[str, str], dict[str, str]]:
             continue
         safe_updates[key] = value
     return safe_updates, blocked_updates
+
+
+def load_safe_code_patch(config: DiscordBotConfig) -> tuple[str, list[str], Optional[str]]:
+    if not config.auto_code_upgrade_enabled:
+        return "", [], "AUTO_CODE_UPGRADE_ENABLED is false"
+
+    patch_text = ""
+    if SUGGESTED_STRATEGY_PATCH_PATH.exists():
+        patch_text = SUGGESTED_STRATEGY_PATCH_PATH.read_text(encoding="utf-8", errors="replace")
+    elif SUGGESTED_STRATEGY_UPDATE_PATH.exists():
+        patch_text = extract_patch_from_markdown(SUGGESTED_STRATEGY_UPDATE_PATH.read_text(encoding="utf-8", errors="replace"))
+
+    if not patch_text.strip():
+        return "", [], None
+
+    targets, blocked_reason = validate_code_patch(patch_text)
+    if blocked_reason:
+        return "", [], blocked_reason
+    return patch_text, targets, None
+
+
+def extract_patch_from_markdown(text: str) -> str:
+    match = re.search(r"```(?:diff|patch)\s*\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip() + "\n"
+
+
+def validate_code_patch(patch_text: str) -> tuple[list[str], Optional[str]]:
+    targets: list[str] = []
+    saw_hunk = False
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith("@@"):
+            saw_hunk = True
+        if raw_line.startswith("--- "):
+            source_target = normalize_patch_target(raw_line[4:].strip())
+            if source_target == "/dev/null":
+                return [], "new or deleted files are not allowed in automatic code upgrades"
+        if raw_line.startswith("+++ "):
+            target = normalize_patch_target(raw_line[4:].strip())
+            if target == "/dev/null":
+                return [], "new or deleted files are not allowed in automatic code upgrades"
+            if not target:
+                return [], "code patch target could not be parsed"
+            if target not in SAFE_CODE_UPGRADE_TARGETS:
+                return [], f"code patch target `{target}` is outside the automatic allowlist"
+            if target not in targets:
+                targets.append(target)
+    if not targets:
+        return [], "code patch did not include any allowed file targets"
+    if not saw_hunk:
+        return [], "code patch did not contain any diff hunks"
+    return targets, None
+
+
+def normalize_patch_target(value: str) -> str:
+    target = value.strip()
+    if target.startswith("a/") or target.startswith("b/"):
+        target = target[2:]
+    return target.replace("\\", "/")
 
 
 def parse_suggested_env_file() -> dict[str, str]:
@@ -977,6 +1110,63 @@ def apply_env_updates(updates: dict[str, str]) -> dict[str, str]:
     return applied
 
 
+def apply_code_patch(patch_text: str, targets: list[str]) -> str:
+    git = find_executable("git")
+    if not git:
+        raise RuntimeError("git is not available, so code patches cannot be auto-applied.")
+
+    AUTO_UPGRADE_PATCH_PATH.write_text(patch_text, encoding="utf-8")
+    try:
+        check_result = subprocess.run(
+            [git, "apply", "--check", str(AUTO_UPGRADE_PATCH_PATH)],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check_result.returncode != 0:
+            raise RuntimeError(f"git apply --check failed: {truncate(check_result.stderr or check_result.stdout, 1200)}")
+
+        apply_result = subprocess.run(
+            [git, "apply", str(AUTO_UPGRADE_PATCH_PATH)],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if apply_result.returncode != 0:
+            raise RuntimeError(f"git apply failed: {truncate(apply_result.stderr or apply_result.stdout, 1200)}")
+        return f"applied patch to {', '.join(targets)}"
+    finally:
+        try:
+            AUTO_UPGRADE_PATCH_PATH.unlink()
+        except OSError:
+            pass
+
+
+def compile_python_targets(targets: list[str]) -> str:
+    python_targets = [target for target in targets if target.endswith(".py")]
+    if not python_targets:
+        return "no python files touched"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "py_compile", *python_targets],
+        cwd=PROJECT_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"py_compile failed: {truncate(result.stderr or result.stdout, 1200)}")
+    return f"py_compile passed for {', '.join(python_targets)}"
+
+
+def restore_backup(backup_dir: Path) -> None:
+    for backup_file in backup_dir.iterdir():
+        if backup_file.is_file():
+            shutil.copy2(backup_file, PROJECT_DIR / backup_file.name)
+
+
 def commit_upgrade_changes() -> str:
     git = find_executable("git")
     if not git:
@@ -990,11 +1180,15 @@ def commit_upgrade_changes() -> str:
         check=False,
     )
     paths = [
+        "main.py",
+        "trade_analyzer.py",
         "learning_report.md",
         "learning_state.json",
         "suggested_env_update.txt",
         "suggested_strategy_update.md",
     ]
+    if SUGGESTED_STRATEGY_PATCH_PATH.exists():
+        paths.append("suggested_strategy_update.patch")
     if tracked_env.returncode == 0:
         paths.append(".env")
 
@@ -1033,10 +1227,36 @@ def build_upgrade_ready_embed(config: DiscordBotConfig, upgrade_state: dict[str,
     embed.add_field(name="Risk level", value=f"`{upgrade_state.get('risk_level', 'unknown')}`", inline=True)
     embed.add_field(name="Top losing pattern", value=truncate(top_pattern, MAX_FIELD_LENGTH), inline=False)
     embed.add_field(name="Proposed .env changes", value=truncate(format_dict_lines(upgrade_state.get("safe_updates", {})), MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Code patch", value=truncate(code_patch_status(config, upgrade_state), MAX_FIELD_LENGTH), inline=False)
     blocked = upgrade_state.get("blocked_updates") or {}
     if blocked:
         embed.add_field(name="Blocked suggestions", value=truncate(format_dict_lines(blocked), MAX_FIELD_LENGTH), inline=False)
-    embed.add_field(name="Code changes", value="`not auto-applied` unless AUTO_CODE_UPGRADE_ENABLED=true", inline=False)
+    return embed
+
+
+def build_auto_upgrade_ready_embed(
+    config: DiscordBotConfig,
+    upgrade_state: dict[str, Any],
+    snapshot: PositionSnapshot,
+) -> discord.Embed:
+    state = upgrade_state.get("learning_state", {})
+    metrics = state.get("metrics", {})
+    patterns = state.get("detected_losing_patterns", [])
+    top_pattern = patterns[0].get("pattern", "none detected") if patterns else "none detected"
+    description = "Position is flat. Auto-upgrade will apply now."
+    if snapshot.is_open:
+        description = (
+            f"Open {snapshot.side} position detected. New entries are paused and the auto-upgrade "
+            "will apply once the position is flat."
+        )
+    embed = make_embed("Automatic upgrade queued", description, discord.Color.gold())
+    embed.add_field(name="Win rate", value=f"`{metrics.get('win_rate_pct', 0)}%`", inline=True)
+    embed.add_field(name="Profit factor", value=f"`{metrics.get('profit_factor', 0)}`", inline=True)
+    embed.add_field(name="Risk level", value=f"`{upgrade_state.get('risk_level', 'unknown')}`", inline=True)
+    embed.add_field(name="Top losing pattern", value=truncate(top_pattern, MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Applied mode", value="`automatic without human approval`", inline=True)
+    embed.add_field(name="Proposed .env changes", value=truncate(format_dict_lines(upgrade_state.get("safe_updates", {})), MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Code patch", value=truncate(code_patch_status(config, upgrade_state), MAX_FIELD_LENGTH), inline=False)
     return embed
 
 
@@ -1055,14 +1275,21 @@ def build_waiting_for_flat_embed(snapshot: PositionSnapshot) -> discord.Embed:
 def build_upgrade_status_embed(upgrade_state: dict[str, Any], config: DiscordBotConfig) -> discord.Embed:
     embed = make_embed("Auto-upgrade status", color=discord.Color.blue())
     embed.add_field(name="Enabled", value=f"`{str(config.auto_upgrade_enabled).lower()}`", inline=True)
+    embed.add_field(
+        name="Approval mode",
+        value=f"`{'manual approval' if config.auto_upgrade_require_approval else 'automatic apply'}`",
+        inline=True,
+    )
     embed.add_field(name="Interval", value=f"`{config.auto_upgrade_interval_hours}h`", inline=True)
     embed.add_field(name="Status", value=f"`{upgrade_state.get('status', 'idle')}`", inline=True)
     embed.add_field(name="Created", value=f"`{upgrade_state.get('created_at') or 'n/a'}`", inline=False)
     expires_at = float(upgrade_state.get("expires_at") or 0.0)
     remaining = max(0, int(expires_at - time.monotonic())) if expires_at else 0
-    embed.add_field(name="Approval expires in", value=f"`{remaining}s`", inline=True)
+    approval_window = f"`{remaining}s`" if config.auto_upgrade_require_approval else "`n/a (automatic apply)`"
+    embed.add_field(name="Approval expires in", value=approval_window, inline=True)
     embed.add_field(name="Risk level", value=f"`{upgrade_state.get('risk_level', 'none')}`", inline=True)
     embed.add_field(name="Safe updates", value=truncate(format_dict_lines(upgrade_state.get("safe_updates", {})), MAX_FIELD_LENGTH), inline=False)
+    embed.add_field(name="Code patch", value=truncate(code_patch_status(config, upgrade_state), MAX_FIELD_LENGTH), inline=False)
     return embed
 
 
@@ -1073,6 +1300,7 @@ def build_suggestions_embed() -> discord.Embed:
     embed.add_field(name="Blocked suggestions", value=truncate(format_dict_lines(blocked_updates), MAX_FIELD_LENGTH), inline=False)
     embed.add_field(name="Suggested env file", value=file_status(SUGGESTED_ENV_UPDATE_PATH), inline=True)
     embed.add_field(name="Strategy notes", value=file_status(SUGGESTED_STRATEGY_UPDATE_PATH), inline=True)
+    embed.add_field(name="Strategy patch", value=file_status(SUGGESTED_STRATEGY_PATCH_PATH), inline=True)
     return embed
 
 
@@ -1087,14 +1315,29 @@ async def dm_admins(bot: commands.Bot, config: DiscordBotConfig, embed: discord.
             logging.getLogger("discord_bot").warning("Could not DM admin user_id=%s: %s", user_id, exc)
 
 
-def risk_level_for_updates(updates: dict[str, str]) -> str:
-    if not updates:
+def risk_level_for_updates(updates: dict[str, str], code_targets: Optional[list[str]] = None) -> str:
+    target_count = len(code_targets or [])
+    if not updates and target_count == 0:
         return "none"
+    if target_count > 0:
+        return "high-review"
     if len(updates) <= 2:
         return "low"
     if len(updates) <= 5:
         return "medium"
     return "high-review"
+
+
+def code_patch_status(config: DiscordBotConfig, upgrade_state: dict[str, Any]) -> str:
+    if not config.auto_code_upgrade_enabled:
+        return "AUTO_CODE_UPGRADE_ENABLED=false"
+    targets = [str(item) for item in (upgrade_state.get("code_patch_targets") or []) if str(item).strip()]
+    blocked_reason = upgrade_state.get("blocked_code_patch_reason")
+    if targets:
+        return f"ready -> {', '.join(targets)}"
+    if blocked_reason:
+        return f"blocked -> {blocked_reason}"
+    return "enabled but no patch detected"
 
 
 def format_dict_lines(values: dict[str, Any]) -> str:

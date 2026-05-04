@@ -165,6 +165,7 @@ class BotConfig:
     tp1_profit_pct: Decimal
     tp2_profit_pct: Decimal
     tp1_close_ratio: Decimal
+    estimated_trade_fee_quote: Decimal
     use_testnet: bool
     dry_run: bool
     live_trading: bool
@@ -255,6 +256,7 @@ class BotConfig:
             tp1_profit_pct=get_decimal_env("TP1_PROFIT_PCT", "0.5"),
             tp2_profit_pct=get_decimal_env("TP2_PROFIT_PCT", "0.9"),
             tp1_close_ratio=get_decimal_env("TP1_CLOSE_RATIO", "0.6"),
+            estimated_trade_fee_quote=get_decimal_env("ESTIMATED_TRADE_FEE_USDC", "0.08"),
             use_testnet=get_bool_env("USE_TESTNET", True),
             dry_run=get_bool_env("DRY_RUN", True),
             live_trading=get_bool_env("LIVE_TRADING", False),
@@ -317,6 +319,8 @@ class BotConfig:
             raise ConfigError("TP settings must satisfy 0 < TP1_PROFIT_PCT < TP2_PROFIT_PCT < 100.")
         if not Decimal("0") < self.tp1_close_ratio < Decimal("1"):
             raise ConfigError("TP1_CLOSE_RATIO must be between 0 and 1.")
+        if self.estimated_trade_fee_quote < 0:
+            raise ConfigError("ESTIMATED_TRADE_FEE_USDC must be greater than or equal to 0.")
         if self.loop_interval_seconds <= 0:
             raise ConfigError("LOOP_INTERVAL_SECONDS must be greater than 0.")
         if self.request_timeout <= 0:
@@ -404,6 +408,7 @@ class PositionExitState:
     original_quantity: Decimal
     tp1_done: bool = False
     break_even_armed: bool = False
+    allocated_fee_quote: Decimal = Decimal("0")
 
 
 @dataclass
@@ -1269,16 +1274,27 @@ class BinanceFuturesBot:
         assert self.exit_state is not None
 
         profit_pct = calculate_unrealized_profit_pct(position, mark_price)
+        tp1_target_pct = self.calculate_effective_take_profit_pct(
+            position,
+            self.config.tp1_profit_pct,
+            include_fee_recovery=True,
+        )
+        tp2_target_pct = self.calculate_effective_take_profit_pct(
+            position,
+            self.config.tp2_profit_pct,
+            include_fee_recovery=True,
+        )
 
         if not self.exit_state.tp1_done:
             stop_reason = self.initial_stop_reason(position, mark_price)
             if stop_reason:
                 return self.handle_full_exit(position, mark_price, stop_reason)
 
-            if profit_pct >= self.config.tp1_profit_pct:
+            if profit_pct >= tp1_target_pct:
                 quantity = self.calculate_tp1_close_quantity(position)
                 reason = (
-                    f"TP1 hit at {format_decimal(profit_pct)}% profit. "
+                    f"TP1 hit at {format_decimal(profit_pct)}% gross move "
+                    f"(fee-aware target {format_decimal(tp1_target_pct)}%). "
                     f"Closing {format_decimal(self.config.tp1_close_ratio * Decimal('100'))}% and moving SL to break-even."
                 )
                 return self.handle_tp1_exit(
@@ -1286,13 +1302,16 @@ class BinanceFuturesBot:
                     mark_price=mark_price,
                     quantity=quantity,
                     reason=reason,
-                    tp2_already_reached=profit_pct >= self.config.tp2_profit_pct,
+                    tp2_already_reached=profit_pct >= tp2_target_pct,
                 )
 
             return False
 
         if self.tp2_reached(position, mark_price):
-            reason = f"TP2 hit at {format_decimal(profit_pct)}% profit. Closing remaining position."
+            reason = (
+                f"TP2 hit at {format_decimal(profit_pct)}% gross move "
+                f"(target {format_decimal(self.config.tp2_profit_pct)}%). Closing remaining position."
+            )
             return self.handle_full_exit(position, mark_price, reason)
 
         break_even_reason = self.break_even_stop_reason(position, mark_price)
@@ -1305,16 +1324,27 @@ class BinanceFuturesBot:
         assert self.exit_state is not None
 
         profit_pct = calculate_unrealized_profit_pct(position, mark_price)
+        tp1_target_pct = self.calculate_effective_take_profit_pct(
+            position,
+            self.config.tp1_profit_pct,
+            include_fee_recovery=True,
+        )
+        tp2_target_pct = self.calculate_effective_take_profit_pct(
+            position,
+            self.config.tp2_profit_pct,
+            include_fee_recovery=True,
+        )
 
         if not self.exit_state.tp1_done:
             stop_reason = self.initial_stop_reason(position, mark_price)
             if stop_reason:
                 return self.handle_full_exit(position, mark_price, stop_reason)
 
-            if profit_pct >= self.config.tp1_profit_pct:
+            if profit_pct >= tp1_target_pct:
                 quantity = self.calculate_tp1_close_quantity(position)
                 reason = (
-                    f"TP1 hit at {format_decimal(profit_pct)}% profit. "
+                    f"TP1 hit at {format_decimal(profit_pct)}% gross move "
+                    f"(fee-aware target {format_decimal(tp1_target_pct)}%). "
                     f"Closing {format_decimal(self.config.tp1_close_ratio * Decimal('100'))}% and moving SL to break-even."
                 )
                 return self.handle_tp1_exit(
@@ -1322,13 +1352,16 @@ class BinanceFuturesBot:
                     mark_price=mark_price,
                     quantity=quantity,
                     reason=reason,
-                    tp2_already_reached=profit_pct >= self.config.tp2_profit_pct,
+                    tp2_already_reached=profit_pct >= tp2_target_pct,
                 )
 
             return False
 
         if self.tp2_reached(position, mark_price):
-            reason = f"TP2 hit at {format_decimal(profit_pct)}% profit. Closing remaining position."
+            reason = (
+                f"TP2 hit at {format_decimal(profit_pct)}% gross move "
+                f"(target {format_decimal(self.config.tp2_profit_pct)}%). Closing remaining position."
+            )
             return self.handle_full_exit(position, mark_price, reason)
 
         break_even_reason = self.break_even_stop_reason(position, mark_price)
@@ -1379,10 +1412,11 @@ class BinanceFuturesBot:
         stop_price = self.calculate_stop_price(position, break_even=False)
         tp1_price = self.calculate_take_profit_price(position, self.config.tp1_profit_pct)
         tp2_price = self.calculate_take_profit_price(position, self.config.tp2_profit_pct)
+        fee_recovery_pct = self.calculate_fee_recovery_profit_pct(position)
         self.logger.warning(warning)
         self.logger.info(
             "Software-managed levels: side=%s entry=%s stop_loss=%s tp1=%s tp2=%s "
-            "position_size=%s tp1_quantity=%s tp2_quantity=%s",
+            "position_size=%s tp1_quantity=%s tp2_quantity=%s estimated_trade_fee=%s fee_recovery_pct=%s",
             position.side,
             format_decimal(position.entry_price),
             format_decimal(stop_price),
@@ -1391,6 +1425,8 @@ class BinanceFuturesBot:
             format_decimal(abs(position.quantity)),
             format_decimal(tp1_quantity),
             format_decimal(tp2_quantity),
+            format_decimal(self.config.estimated_trade_fee_quote),
+            format_decimal(fee_recovery_pct),
         )
         send_discord_message(
             f"{warning}\n"
@@ -1400,6 +1436,8 @@ class BinanceFuturesBot:
             f"stop_loss: {format_decimal(stop_price)}\n"
             f"TP1: {format_decimal(tp1_price)}\n"
             f"TP2: {format_decimal(tp2_price)}\n"
+            f"estimated_trade_fee: {format_decimal(self.config.estimated_trade_fee_quote)}\n"
+            f"fee_recovery_pct: {format_decimal(fee_recovery_pct)}\n"
             f"exchange_backup_sl: {'enabled' if self.config.enable_exchange_backup_sl else 'disabled'}\n"
             f"position_size: {format_decimal(abs(position.quantity))}"
         )
@@ -1415,6 +1453,7 @@ class BinanceFuturesBot:
             f"side: {position.side}\n"
             f"entry: {format_decimal(position.entry_price)}\n"
             f"remaining_quantity: {format_decimal(abs(position.quantity))}\n"
+            f"estimated_trade_fee_recovered: {format_decimal(self.config.estimated_trade_fee_quote)}\n"
             f"action: close with reduceOnly MARKET if mark price returns to entry"
         )
         self.logger.info(message.replace("\n", " | "))
@@ -1432,13 +1471,74 @@ class BinanceFuturesBot:
             return self.round_price_to_tick(position.entry_price * (Decimal("1") + stop_loss_ratio))
         raise ConfigError("Cannot calculate stop price for a flat position.")
 
-    def calculate_take_profit_price(self, position: Position, profit_pct: Decimal) -> Decimal:
-        profit_ratio = profit_pct / Decimal("100")
+    def calculate_fee_recovery_profit_pct(self, position: Position) -> Decimal:
+        if self.config.estimated_trade_fee_quote <= 0:
+            return Decimal("0")
+
+        position_notional = abs(position.quantity) * position.entry_price
+        if position_notional <= 0:
+            return Decimal("0")
+        return (self.config.estimated_trade_fee_quote / position_notional) * Decimal("100")
+
+    def calculate_effective_take_profit_pct(
+        self,
+        position: Position,
+        profit_pct: Decimal,
+        *,
+        include_fee_recovery: bool,
+    ) -> Decimal:
+        effective_profit_pct = profit_pct
+        if include_fee_recovery:
+            effective_profit_pct += self.calculate_fee_recovery_profit_pct(position)
+        return effective_profit_pct
+
+    def calculate_take_profit_price(
+        self,
+        position: Position,
+        profit_pct: Decimal,
+        *,
+        include_fee_recovery: bool = True,
+    ) -> Decimal:
+        effective_profit_pct = self.calculate_effective_take_profit_pct(
+            position,
+            profit_pct,
+            include_fee_recovery=include_fee_recovery,
+        )
+        profit_ratio = effective_profit_pct / Decimal("100")
         if position.side == "LONG":
             return self.round_price_to_tick(position.entry_price * (Decimal("1") + profit_ratio))
         if position.side == "SHORT":
             return self.round_price_to_tick(position.entry_price * (Decimal("1") - profit_ratio))
         raise ConfigError("Cannot calculate take-profit price for a flat position.")
+
+    def calculate_estimated_close_fee(
+        self,
+        position: Position,
+        quantity: Decimal,
+        *,
+        final_exit: bool,
+    ) -> Decimal:
+        total_fee = self.config.estimated_trade_fee_quote
+        if total_fee <= 0:
+            return Decimal("0")
+
+        original_quantity = abs(position.quantity)
+        if self.exit_state is not None and self.exit_state.key == build_position_key(position):
+            original_quantity = self.exit_state.original_quantity
+        if original_quantity <= 0:
+            return Decimal("0")
+
+        allocated_fee = Decimal("0")
+        if self.exit_state is not None and self.exit_state.key == build_position_key(position):
+            allocated_fee = self.exit_state.allocated_fee_quote
+
+        remaining_fee = max(Decimal("0"), total_fee - allocated_fee)
+        if final_exit:
+            return remaining_fee
+
+        fee_share = min(Decimal("1"), max(Decimal("0"), quantity / original_quantity))
+        estimated_fee = total_fee * fee_share
+        return min(remaining_fee, estimated_fee)
 
     def round_price_to_tick(self, price: Decimal) -> Decimal:
         assert self.symbol_rules is not None
@@ -1816,7 +1916,13 @@ class BinanceFuturesBot:
 
     def tp2_reached(self, position: Position, mark_price: Decimal) -> bool:
         profit_pct = calculate_unrealized_profit_pct(position, mark_price)
-        return profit_pct >= self.config.tp2_profit_pct
+        include_fee_recovery = self.exit_state is None or not self.exit_state.tp1_done
+        target_pct = self.calculate_effective_take_profit_pct(
+            position,
+            self.config.tp2_profit_pct,
+            include_fee_recovery=include_fee_recovery,
+        )
+        return profit_pct >= target_pct
 
     def calculate_tp1_close_quantity(self, position: Position) -> Decimal:
         assert self.symbol_rules is not None
@@ -2089,6 +2195,7 @@ class BinanceFuturesBot:
         planned_position = Position(quantity=signed_quantity, entry_price=mark_price)
         tp1_quantity = self.calculate_tp1_quantity_from_original(quantity)
         tp2_quantity = round_to_step(quantity - tp1_quantity, self.symbol_rules.qty_step)
+        fee_recovery_pct = self.calculate_fee_recovery_profit_pct(planned_position)
         self.log_entry_risk_before_order(action, quantity, mark_price, sizing_plan)
         self.logger.info(
             "Dry-run enabled. Planned entry=%s quantity=%s %s",
@@ -2098,7 +2205,7 @@ class BinanceFuturesBot:
         )
         self.logger.info(
             "Dry-run protection: software SL=%s; software TP1=%s quantity=%s; software TP2=%s quantity=%s; "
-            "exchange backup SL algo=%s; exchange backup TP2 algo=%s.",
+            "exchange backup SL algo=%s; exchange backup TP2 algo=%s; estimated_trade_fee=%s; fee_recovery_pct=%s.",
             format_decimal(self.calculate_stop_price(planned_position, break_even=False)),
             format_decimal(self.calculate_take_profit_price(planned_position, self.config.tp1_profit_pct)),
             format_decimal(tp1_quantity),
@@ -2106,6 +2213,8 @@ class BinanceFuturesBot:
             format_decimal(tp2_quantity),
             self.config.enable_exchange_backup_sl,
             self.config.enable_exchange_backup_tp,
+            format_decimal(self.config.estimated_trade_fee_quote),
+            format_decimal(fee_recovery_pct),
         )
 
     def log_entry_risk_before_order(
@@ -2121,10 +2230,12 @@ class BinanceFuturesBot:
         tp1_price = self.calculate_take_profit_price(planned_position, self.config.tp1_profit_pct)
         tp2_price = self.calculate_take_profit_price(planned_position, self.config.tp2_profit_pct)
         notional = quantity * estimated_entry_price
+        fee_recovery_pct = self.calculate_fee_recovery_profit_pct(planned_position)
 
         self.logger.info(
             "Entry plan before placing order: side=%s estimated_entry=%s stop_loss=%s "
-            "tp1=%s tp2=%s position_size=%s %s notional_usdt=%s sizing_source=%s leverage=%sx",
+            "tp1=%s tp2=%s position_size=%s %s notional_usdt=%s sizing_source=%s leverage=%sx "
+            "estimated_trade_fee=%s fee_recovery_pct=%s",
             action,
             format_decimal(estimated_entry_price),
             format_decimal(stop_loss),
@@ -2135,6 +2246,8 @@ class BinanceFuturesBot:
             format_decimal(notional),
             sizing_plan.source,
             sizing_plan.leverage,
+            format_decimal(self.config.estimated_trade_fee_quote),
+            format_decimal(fee_recovery_pct),
         )
 
     def build_trade_context_from_signal(self, signal: TradingSignal, position: Position) -> TradeContext:
@@ -2357,7 +2470,15 @@ class BinanceFuturesBot:
             self.config.symbol,
         )
         self.submit_market_order(side=side, quantity=quantity, reduce_only=True)
-        realized_pnl = calculate_realized_pnl(position, exit_price, quantity)
+        gross_realized_pnl = calculate_realized_pnl(position, exit_price, quantity)
+        estimated_fee = self.calculate_estimated_close_fee(
+            position,
+            quantity,
+            final_exit=final_exit,
+        )
+        realized_pnl = gross_realized_pnl - estimated_fee
+        if self.exit_state is not None and self.exit_state.key == build_position_key(position):
+            self.exit_state.allocated_fee_quote += estimated_fee
         self.record_trade_close(realized_pnl)
         self.log_trade_to_csv(
             position=position,
@@ -2378,6 +2499,8 @@ class BinanceFuturesBot:
             f"reason: {reason}\n"
             f"exit_price: {format_decimal(exit_price)}\n"
             f"closed_quantity: {format_decimal(quantity)}\n"
+            f"gross_pnl_usdt: {format_decimal(gross_realized_pnl)}\n"
+            f"estimated_fee_usdt: {format_decimal(estimated_fee)}\n"
             f"estimated_pnl_usdt: {format_decimal(realized_pnl)}\n"
             f"trades_today: {self.trades_today}\n"
             f"losses_today: {self.losses_today}"
