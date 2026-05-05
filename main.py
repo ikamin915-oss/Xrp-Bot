@@ -153,6 +153,12 @@ class BotConfig:
     ema_fast: int
     ema_slow: int
     ema_trend: int
+    rsi_period: int
+    rsi_long_min: Decimal
+    rsi_long_max: Decimal
+    rsi_short_min: Decimal
+    rsi_short_max: Decimal
+    rsi_enable_filter: bool
     order_size_quote: Decimal
     leverage: int
     use_wallet_percent_size: bool
@@ -244,6 +250,12 @@ class BotConfig:
             ema_fast=get_int_env("EMA_FAST", 7),
             ema_slow=get_int_env("EMA_SLOW", 25),
             ema_trend=get_int_env("EMA_TREND", 99),
+            rsi_period=get_int_env("RSI_PERIOD", 14),
+            rsi_long_min=get_decimal_env("RSI_LONG_MIN", "45"),
+            rsi_long_max=get_decimal_env("RSI_LONG_MAX", "65"),
+            rsi_short_min=get_decimal_env("RSI_SHORT_MIN", "35"),
+            rsi_short_max=get_decimal_env("RSI_SHORT_MAX", "55"),
+            rsi_enable_filter=get_bool_env("RSI_ENABLE_FILTER", True),
             order_size_quote=get_order_size_quote_env("6"),
             leverage=get_int_env("LEVERAGE", 3),
             use_wallet_percent_size=get_bool_env("USE_WALLET_PERCENT_SIZE", False),
@@ -293,10 +305,16 @@ class BotConfig:
             raise ConfigError("This pullback/rejection strategy is locked to INTERVAL=5m.")
         if self.ema_fast <= 0 or self.ema_slow <= 0 or self.ema_trend <= 0:
             raise ConfigError("EMA_FAST, EMA_SLOW, and EMA_TREND must be positive integers.")
+        if self.rsi_period <= 0:
+            raise ConfigError("RSI_PERIOD must be a positive integer.")
         if not self.ema_fast < self.ema_slow < self.ema_trend:
             raise ConfigError("EMA settings must satisfy EMA_FAST < EMA_SLOW < EMA_TREND.")
-        if self.candle_limit < self.ema_trend + 5:
+        if self.candle_limit < max(self.ema_trend, self.rsi_period) + 5:
             raise ConfigError("CANDLE_LIMIT is too small for the selected indicators.")
+        if not Decimal("0") <= self.rsi_long_min <= self.rsi_long_max <= Decimal("100"):
+            raise ConfigError("RSI long filter must satisfy 0 <= RSI_LONG_MIN <= RSI_LONG_MAX <= 100.")
+        if not Decimal("0") <= self.rsi_short_min <= self.rsi_short_max <= Decimal("100"):
+            raise ConfigError("RSI short filter must satisfy 0 <= RSI_SHORT_MIN <= RSI_SHORT_MAX <= 100.")
         if not Decimal("0") < self.order_size_quote:
             raise ConfigError("ORDER_SIZE_USDC/ORDER_SIZE_USDT must be greater than 0.")
         if self.leverage <= 0:
@@ -387,6 +405,7 @@ class TradingSignal:
     ema_fast: Decimal
     ema_slow: Decimal
     ema_trend: Decimal
+    rsi_value: Optional[Decimal]
     ema_spread_pct: Decimal
     candle_body_ratio: Decimal
     distance_from_ema7_pct: Decimal
@@ -481,6 +500,8 @@ class BinanceFuturesBot:
         self.backup_tp_algo_id: Optional[str] = None
         self.last_backup_algo_warning_key: Optional[str] = None
         self.last_macro_summary = "Macro filter: BTC trend = unknown | ETH trend = unknown | Decision = not checked"
+        self.last_rsi_value: Optional[Decimal] = None
+        self.last_rsi_summary = "RSI filter: not checked"
         self.load_daily_state()
 
     def run(self) -> None:
@@ -524,6 +545,15 @@ class BinanceFuturesBot:
             "Macro filter settings: ENABLE_MACRO_FILTER=%s MACRO_INTERVAL=%s",
             self.config.enable_macro_filter,
             self.config.macro_interval,
+        )
+        self.logger.info(
+            "RSI filter settings: RSI_ENABLE_FILTER=%s RSI_PERIOD=%s LONG_RANGE=%s-%s SHORT_RANGE=%s-%s",
+            self.config.rsi_enable_filter,
+            self.config.rsi_period,
+            format_decimal(self.config.rsi_long_min),
+            format_decimal(self.config.rsi_long_max),
+            format_decimal(self.config.rsi_short_min),
+            format_decimal(self.config.rsi_short_max),
         )
         if get_bool_env("AUTO_UPGRADE_ENABLED", False):
             self.logger.info(
@@ -823,10 +853,11 @@ class BinanceFuturesBot:
         signal = self.generate_signal(candles)
         macro_snapshot = self.fetch_macro_trend_snapshot()
         signal = self.apply_macro_filter(signal, macro_snapshot)
+        signal = self.apply_rsi_filter(signal)
         self.last_signal = f"{signal.action} | {signal.reason}"
 
         self.logger.info(
-            "Signal=%s | close=%s | mark=%s | EMA(%s)=%s | EMA(%s)=%s | EMA(%s)=%s | reason=%s",
+            "Signal=%s | close=%s | mark=%s | EMA(%s)=%s | EMA(%s)=%s | EMA(%s)=%s | RSI=%s | reason=%s",
             signal.action,
             signal.close_price,
             mark_price,
@@ -836,6 +867,7 @@ class BinanceFuturesBot:
             signal.ema_slow,
             self.config.ema_trend,
             signal.ema_trend,
+            format_decimal(signal.rsi_value) if signal.rsi_value is not None else "unavailable",
             signal.reason,
         )
 
@@ -896,7 +928,7 @@ class BinanceFuturesBot:
             symbol=self.config.symbol,
             interval=self.config.interval,
             limit=self.config.candle_limit,
-            min_required=self.config.ema_trend + 3,
+            min_required=max(self.config.ema_trend, self.config.rsi_period) + 3,
             warning_prefix="Not enough candles returned; skipping cycle.",
         )
         if frame is not None:
@@ -921,7 +953,28 @@ class BinanceFuturesBot:
         frame["ema_fast"] = frame["close"].ewm(span=self.config.ema_fast, adjust=False).mean()
         frame["ema_slow"] = frame["close"].ewm(span=self.config.ema_slow, adjust=False).mean()
         frame["ema_trend"] = frame["close"].ewm(span=self.config.ema_trend, adjust=False).mean()
+        frame["rsi"] = self.calculate_rsi_series(frame["close"])
         return frame
+
+    def calculate_rsi_series(self, close_series: pd.Series) -> pd.Series:
+        delta = close_series.diff()
+        gains = delta.clip(lower=0)
+        losses = -delta.clip(upper=0)
+        avg_gain = gains.ewm(
+            alpha=1 / self.config.rsi_period,
+            min_periods=self.config.rsi_period,
+            adjust=False,
+        ).mean()
+        avg_loss = losses.ewm(
+            alpha=1 / self.config.rsi_period,
+            min_periods=self.config.rsi_period,
+            adjust=False,
+        ).mean()
+        rs = avg_gain / avg_loss.replace(0, pd.NA)
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.where(avg_loss != 0, 100.0)
+        rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
+        return pd.to_numeric(rsi, errors="coerce")
 
     def fetch_market_candles(
         self,
@@ -1098,20 +1151,7 @@ class BinanceFuturesBot:
 
         if macro_snapshot is None:
             if signal.action != "HOLD":
-                return TradingSignal(
-                    action="HOLD",
-                    reason=f"{signal.reason} Macro filter data unavailable; skipping trade.",
-                    close_price=signal.close_price,
-                    ema_fast=signal.ema_fast,
-                    ema_slow=signal.ema_slow,
-                    ema_trend=signal.ema_trend,
-                    ema_spread_pct=signal.ema_spread_pct,
-                    candle_body_ratio=signal.candle_body_ratio,
-                    distance_from_ema7_pct=signal.distance_from_ema7_pct,
-                    volume=signal.volume,
-                    previous_candle_direction=signal.previous_candle_direction,
-                    candle_close_time=signal.candle_close_time,
-                )
+                return self.signal_to_hold(signal, f"{signal.reason} Macro filter data unavailable; skipping trade.")
             return signal
 
         decision = "allowed"
@@ -1142,24 +1182,79 @@ class BinanceFuturesBot:
         )
 
         if signal.action in {"LONG", "SHORT"} and decision == "rejected":
-            return TradingSignal(
-                action="HOLD",
-                reason=(
+            return self.signal_to_hold(
+                signal,
+                (
                     f"{signal.reason} Macro filter rejected: BTC {macro_snapshot.btc_trend}, "
                     f"ETH {macro_snapshot.eth_trend}."
                 ),
-                close_price=signal.close_price,
-                ema_fast=signal.ema_fast,
-                ema_slow=signal.ema_slow,
-                ema_trend=signal.ema_trend,
-                ema_spread_pct=signal.ema_spread_pct,
-                candle_body_ratio=signal.candle_body_ratio,
-                distance_from_ema7_pct=signal.distance_from_ema7_pct,
-                volume=signal.volume,
-                previous_candle_direction=signal.previous_candle_direction,
-                candle_close_time=signal.candle_close_time,
             )
         return signal
+
+    def apply_rsi_filter(self, signal: TradingSignal) -> TradingSignal:
+        self.last_rsi_value = signal.rsi_value
+        rsi_text = format_decimal(signal.rsi_value) if signal.rsi_value is not None else "unavailable"
+
+        if not self.config.rsi_enable_filter:
+            self.last_rsi_summary = f"RSI={rsi_text} | filter disabled"
+            return signal
+
+        if signal.rsi_value is None:
+            self.last_rsi_summary = f"RSI={rsi_text} | data unavailable"
+            self.logger.warning("RSI data unavailable on XRP candles. Skipping trade.")
+            if signal.action in {"LONG", "SHORT"}:
+                return self.signal_to_hold(signal, f"{signal.reason} RSI data unavailable; skipping trade.")
+            return signal
+
+        if signal.action == "LONG":
+            allowed = self.config.rsi_long_min <= signal.rsi_value <= self.config.rsi_long_max
+            decision = "allowed" if allowed else "rejected"
+            self.last_rsi_summary = f"RSI={rsi_text} | LONG {decision}"
+            self.logger.info("RSI=%s | LONG %s", rsi_text, decision)
+            if not allowed:
+                return self.signal_to_hold(
+                    signal,
+                    (
+                        f"{signal.reason} RSI filter rejected LONG: {rsi_text} is outside "
+                        f"{format_decimal(self.config.rsi_long_min)}-{format_decimal(self.config.rsi_long_max)}."
+                    ),
+                )
+            return signal
+
+        if signal.action == "SHORT":
+            allowed = self.config.rsi_short_min <= signal.rsi_value <= self.config.rsi_short_max
+            decision = "allowed" if allowed else "rejected"
+            self.last_rsi_summary = f"RSI={rsi_text} | SHORT {decision}"
+            self.logger.info("RSI=%s | SHORT %s", rsi_text, decision)
+            if not allowed:
+                return self.signal_to_hold(
+                    signal,
+                    (
+                        f"{signal.reason} RSI filter rejected SHORT: {rsi_text} is outside "
+                        f"{format_decimal(self.config.rsi_short_min)}-{format_decimal(self.config.rsi_short_max)}."
+                    ),
+                )
+            return signal
+
+        self.last_rsi_summary = f"RSI={rsi_text} | HOLD no directional setup"
+        return signal
+
+    def signal_to_hold(self, signal: TradingSignal, reason: str) -> TradingSignal:
+        return TradingSignal(
+            action="HOLD",
+            reason=reason,
+            close_price=signal.close_price,
+            ema_fast=signal.ema_fast,
+            ema_slow=signal.ema_slow,
+            ema_trend=signal.ema_trend,
+            rsi_value=signal.rsi_value,
+            ema_spread_pct=signal.ema_spread_pct,
+            candle_body_ratio=signal.candle_body_ratio,
+            distance_from_ema7_pct=signal.distance_from_ema7_pct,
+            volume=signal.volume,
+            previous_candle_direction=signal.previous_candle_direction,
+            candle_close_time=signal.candle_close_time,
+        )
 
     def generate_signal(self, candles: pd.DataFrame) -> TradingSignal:
         if len(candles) < 3:
@@ -1217,6 +1312,7 @@ class BinanceFuturesBot:
         ema_fast = decimal_from_number(latest["ema_fast"])
         ema_slow = decimal_from_number(latest["ema_slow"])
         ema_trend = decimal_from_number(latest["ema_trend"])
+        rsi_value = None if pd.isna(latest["rsi"]) else decimal_from_number(latest["rsi"])
         candle_range = decimal_from_number(latest["high"]) - decimal_from_number(latest["low"])
         candle_body = abs(decimal_from_number(latest["close"]) - decimal_from_number(latest["open"]))
         candle_body_ratio = safe_decimal_ratio(candle_body, candle_range)
@@ -1230,6 +1326,7 @@ class BinanceFuturesBot:
             ema_fast=ema_fast,
             ema_slow=ema_slow,
             ema_trend=ema_trend,
+            rsi_value=rsi_value,
             ema_spread_pct=ema_spread_pct,
             candle_body_ratio=candle_body_ratio,
             distance_from_ema7_pct=distance_from_ema7_pct,
@@ -2656,6 +2753,7 @@ class BinanceFuturesBot:
             f"ema7: {format_decimal(signal.ema_fast)}\n"
             f"ema25: {format_decimal(signal.ema_slow)}\n"
             f"ema99: {format_decimal(signal.ema_trend)}\n"
+            f"rsi: {format_decimal(signal.rsi_value) if signal.rsi_value is not None else 'unavailable'}\n"
             f"reason: {signal.reason}\n"
             f"mode: {self.config.mode_label}"
         )
@@ -2715,6 +2813,8 @@ class BinanceFuturesBot:
             f"losses_today: {self.losses_today}",
             f"last signal: {self.last_signal}",
             f"macro filter: {self.last_macro_summary}",
+            f"rsi: {format_decimal(self.last_rsi_value) if self.last_rsi_value is not None else 'unavailable'}",
+            f"rsi filter: {self.last_rsi_summary}",
             f"paused: {'yes' if self.is_paused() else 'no'}",
             f"dry-run/live status: {self.config.mode_label}",
         ]
